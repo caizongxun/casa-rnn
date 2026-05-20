@@ -2,19 +2,15 @@
 Bio-inspired neuromodulation + SoftModuleRouter + LatentExpertBank.
 
 Changelog:
-  v0.4 - SoftModuleRouter: regime_consistency_loss() uses median split
-       - ContrastiveStateRegularizer: uses median split
-  v0.5 - NeuromodulatorGating: ctx z-score (later found broken, see v0.7.1)
-       - SoftModuleRouter/ContrastiveStateRegularizer: ±0.5σ threshold
-       - LatentExpertBank: K=4 GRU experts
-  v0.7.1 - HomeostaticGainControl: da_set/ne_set setpoints REMOVED as loss
-           targets. homeostatic_loss() now returns 0. The L2 penalty was
-           anchoring DA to 0.55 regardless of any other gradient signal.
-         - NeuromodulatorGating: removed broken _zscore_context call.
-           ctx is passed raw to ctx_encoder; variance comes from timestep
-           differences, not batch-level normalisation.
-         - ctx_encoder sigmoid scaling reduced 2.5/3.5 -> 1.0 to avoid
-           saturating sigmoid near initialisation.
+  v0.7.1 - HomeostaticGainControl setpoint loss disabled
+         - NeuromodulatorGating: removed broken batch z-score on ctx
+  v0.7.2 - Gate bias initialisation (Gu et al. ICML 2020):
+           ctx_encoder final bias = [-2, -1, +1, +2] breaks symmetry so
+           DA/NE/ACh/SHT start with diverse values instead of all 0.5.
+           ctx input scaled: regime x4, log_vol x10, vov x20 to push
+           gradients through ctx_encoder which was previously near-zero.
+           ctx_encoder final layer weight init: 0.1*normal to avoid
+           immediate saturation after bias shift.
 """
 
 import torch
@@ -23,6 +19,9 @@ import torch.nn.functional as F
 from collections import deque
 from typing import Optional, Tuple
 import random
+
+
+CTX_SCALE = torch.tensor([4.0, 10.0, 20.0])  # regime, log_vol, vov
 
 
 def _zscore_masks(reg_scalar: torch.Tensor, threshold: float = 0.5
@@ -37,10 +36,9 @@ def _zscore_masks(reg_scalar: torch.Tensor, threshold: float = 0.5
 
 class NeuromodulatorGating(nn.Module):
     """
-    v0.7.1: removed broken batch z-score on ctx.
-    ctx is passed raw; meaningful variance is across timesteps (T dimension)
-    which naturally flows through when ctx is built from live regime_scalar.
-    Sigmoid scaling reduced to 1.0 to avoid saturation at init.
+    v0.7.2: gate bias init + ctx input scaling.
+    ctx_encoder final bias = [-2, -1, +1, +2] so neuromodulators start
+    with diverse values. ctx inputs scaled to have real dynamic range.
     """
     def __init__(self, hidden_size: int, context_size: int = 3):
         super().__init__()
@@ -50,6 +48,12 @@ class NeuromodulatorGating(nn.Module):
             nn.Linear(32, 16), nn.Tanh(),
             nn.Linear(16, 4),
         )
+        # v0.7.2: diverse bias init -- breaks symmetry at step 0
+        # DA=0.12, ACh=0.27, NE=0.73, SHT=0.88 at init
+        with torch.no_grad():
+            self.ctx_encoder[-1].bias.copy_(torch.tensor([-2.0, -1.0, 1.0, 2.0]))
+            self.ctx_encoder[-1].weight.mul_(0.1)  # small weight, bias dominates early
+
         self.da_gate   = nn.Linear(hidden_size, hidden_size)
         self.ach_proj  = nn.Linear(hidden_size, hidden_size)
         self.ne_gain   = nn.Linear(hidden_size, hidden_size)
@@ -57,9 +61,10 @@ class NeuromodulatorGating(nn.Module):
         self.norm      = nn.LayerNorm(hidden_size)
 
     def forward(self, h: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        # v0.7.1: raw ctx, no z-score (z-score across batch was a no-op)
-        raw = self.ctx_encoder(context)
-        # reduced scaling 2.5/3.5 -> 1.0 to keep sigmoid in linear regime at init
+        # v0.7.2: scale ctx so inputs have meaningful dynamic range
+        scale = CTX_SCALE.to(context.device)
+        ctx_scaled = context * scale
+        raw = self.ctx_encoder(ctx_scaled)
         da  = torch.sigmoid(raw[..., 0:1])
         ach = torch.sigmoid(raw[..., 1:2])
         ne  = torch.sigmoid(raw[..., 2:3])
@@ -245,16 +250,14 @@ class CerebellarForwardModel(nn.Module):
 
 class HomeostaticGainControl(nn.Module):
     """
-    v0.7.1: setpoint loss DISABLED.
-    Previously homeostatic_loss() penalised DA deviating from da_set=0.55,
-    which hard-anchored DA regardless of any other gradient. Now it returns 0.
-    EMA tracking is kept for monitoring only.
+    v0.7.1: setpoint loss disabled (was anchoring DA=0.55).
+    EMA tracking kept for monitoring only.
     """
     def __init__(self, da_set: float = 0.55, ne_set: float = 0.35, sht_set: float = 0.50,
-                 ema_alpha: float = 0.02, penalty_weight: float = 0.0):  # weight=0
+                 ema_alpha: float = 0.02, penalty_weight: float = 0.0):
         super().__init__()
         self.alpha  = ema_alpha
-        self.weight = penalty_weight  # 0.0 -- disabled
+        self.weight = 0.0
         self.register_buffer("da_ema",  torch.tensor(da_set))
         self.register_buffer("ne_ema",  torch.tensor(ne_set))
         self.register_buffer("sht_ema", torch.tensor(sht_set))
@@ -266,7 +269,6 @@ class HomeostaticGainControl(nn.Module):
         self.sht_ema = (1 - self.alpha) * self.sht_ema + self.alpha * sht_mean
 
     def homeostatic_loss(self, da: torch.Tensor, ne: torch.Tensor, sht: torch.Tensor) -> torch.Tensor:
-        # v0.7.1: disabled -- was anchoring DA=0.55 against all other gradients
         return torch.tensor(0.0, device=da.device)
 
 
