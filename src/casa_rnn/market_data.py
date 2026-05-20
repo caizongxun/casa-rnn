@@ -1,30 +1,23 @@
 """
 market_data.py -- Auto-discovery, validation, and enrichment of market data.
 
-Design goals:
-  1. Scan a data directory for CSV/zip files in Binance Data Vision format.
-  2. For ALL symbols (primary + correlated):
-       a. Check if a local file exists.
-       b. If not and auto_download=True: download from Binance public REST API
-          (no API key needed). Default start date: 2020-01-01.
-       c. If download fails: print clear human-readable instructions and raise
-          (primary) or skip (correlated).
-  3. Build enriched feature columns from Binance Data Vision raw columns.
-  4. Compute cross-asset correlation features when correlated data available.
+Download strategy (no API key required, no geo-block):
+  Primary source : Binance Data Vision S3 static files
+                   https://data.binance.vision/data/spot/monthly/klines/
+  Fallback       : Binance REST API (may be geo-blocked in some regions)
+
+Auto-download flow:
+  1. Scan local data_dir for existing files.
+  2. If a symbol is missing and auto_download=True:
+       a. Try Data Vision: download monthly ZIPs for 2020-01 -> current month.
+       b. If all months fail, fall back to REST API.
+  3. Primary symbol failure -> raise FileNotFoundError.
+  4. Correlated symbol failure -> skip with warning (non-fatal).
 
 Binance Data Vision CSV columns (fixed order):
-  0  open_time          ms timestamp
-  1  open
-  2  high
-  3  low
-  4  close
-  5  volume
-  6  close_time
-  7  quote_volume
-  8  count              number of trades
-  9  taker_buy_volume
-  10 taker_buy_quote_volume
-  11 ignore
+  0  open_time, 1 open, 2 high, 3 low, 4 close, 5 volume,
+  6  close_time, 7 quote_volume, 8 count,
+  9  taker_buy_volume, 10 taker_buy_quote_volume, 11 ignore
 """
 
 from __future__ import annotations
@@ -32,7 +25,9 @@ from __future__ import annotations
 import io
 import re
 import time
+import urllib.request
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -43,6 +38,7 @@ import pandas as pd
 # Constants
 # ---------------------------------------------------------------------------
 
+BINANCE_DV_BASE    = "https://data.binance.vision/data/spot/monthly/klines"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 BINANCE_DV_COLS = [
@@ -53,7 +49,7 @@ BINANCE_DV_COLS = [
 
 DEFAULT_CORR_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 DEFAULT_DATA_DIR     = Path("data")
-DEFAULT_START_DATE   = "2020-01-01"   # used when auto-downloading primary symbol
+DEFAULT_START_YEAR   = 2020
 
 
 # ---------------------------------------------------------------------------
@@ -89,14 +85,13 @@ class DataRegistry:
         return self.files.get((symbol.upper(), interval.lower()), [])
 
     def register(self, symbol: str, interval: str, path: Path):
-        """Add a newly downloaded file to the registry without re-scanning."""
         key = (symbol.upper(), interval.lower())
         self.files.setdefault(key, []).append(path)
 
     def summary(self) -> str:
         lines = [f"DataRegistry ({self.data_dir}):"]
         if not self.files:
-            lines.append("  (empty — will auto-download)")
+            lines.append("  (empty - will auto-download via Data Vision)")
         for (sym, iv), paths in sorted(self.files.items()):
             lines.append(f"  {sym} {iv}: {len(paths)} file(s)")
         return "\n".join(lines)
@@ -119,7 +114,6 @@ def _read_bdv_csv(path: Path) -> pd.DataFrame:
         buf = path  # type: ignore[assignment]
 
     df = pd.read_csv(buf, header=None)
-
     if str(df.iloc[0, 0]).lower() == "open_time":
         df = df.iloc[1:].reset_index(drop=True)
 
@@ -160,7 +154,72 @@ def load_symbol(symbol: str, interval: str, registry: DataRegistry) -> Optional[
 
 
 # ---------------------------------------------------------------------------
-# Binance public REST API download (no key required)
+# Binance Data Vision download (S3 static, no geo-block)
+# ---------------------------------------------------------------------------
+
+def _download_data_vision(
+    symbol: str,
+    interval: str,
+    data_dir: Path,
+    registry: DataRegistry,
+    start_year: int = DEFAULT_START_YEAR,
+) -> Optional[pd.DataFrame]:
+    """
+    Download monthly ZIP files from Binance Data Vision for a symbol.
+    Saves each month as a separate ZIP in data_dir.
+    Returns concatenated DataFrame of all downloaded months.
+    """
+    now = datetime.now(timezone.utc)
+    months: List[Tuple[int, int]] = []
+    for year in range(start_year, now.year + 1):
+        for month in range(1, 13):
+            if (year, month) > (now.year, now.month):
+                break
+            months.append((year, month))
+
+    downloaded: List[Path] = []
+    print(f"  [market_data] Data Vision: downloading {symbol} {interval} "
+          f"({start_year}-01 -> {now.year}-{now.month:02d}) ...", flush=True)
+
+    for year, month in months:
+        fname    = f"{symbol}-{interval}-{year}-{month:02d}.zip"
+        url      = f"{BINANCE_DV_BASE}/{symbol}/{interval}/{fname}"
+        out_path = data_dir / fname
+
+        if out_path.exists():
+            downloaded.append(out_path)
+            continue
+
+        try:
+            urllib.request.urlretrieve(url, out_path)
+            downloaded.append(out_path)
+        except Exception:
+            # Month doesn't exist yet or network error - skip silently
+            if out_path.exists():
+                out_path.unlink()
+
+    if not downloaded:
+        return None
+
+    print(f"  [market_data] Downloaded {len(downloaded)} monthly files for {symbol}")
+
+    frames = []
+    for p in downloaded:
+        try:
+            frames.append(_read_bdv_csv(p))
+            registry.register(symbol, interval, p)
+        except Exception as e:
+            print(f"  [market_data] WARNING: could not read {p}: {e}")
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True)
+    return df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Binance REST API download (fallback, may be geo-blocked)
 # ---------------------------------------------------------------------------
 
 def _download_klines_api(
@@ -181,22 +240,21 @@ def _download_klines_api(
     current_start = start_ms
     limit = 500
 
-    print(f"  [market_data] Downloading {symbol} {interval} "
-          f"({pd.Timestamp(start_ms, unit='ms').date()} -> "
-          f"{pd.Timestamp(end_ms,   unit='ms').date()}) ...", flush=True)
+    print(f"  [market_data] REST API fallback: {symbol} {interval} ...", flush=True)
 
     while current_start < end_ms:
         params = dict(symbol=symbol.upper(), interval=interval,
                       startTime=current_start, endTime=end_ms, limit=limit)
         for attempt in range(max_retries):
             try:
-                resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+                import requests as _req
+                resp = _req.get(BINANCE_KLINES_URL, params=params, timeout=15)
                 resp.raise_for_status()
                 data = resp.json()
                 break
             except Exception as e:
                 if attempt == max_retries - 1:
-                    print(f"  [market_data] API request failed: {e}")
+                    print(f"  [market_data] REST API failed: {e}")
                     return None
                 time.sleep(2 ** attempt)
 
@@ -210,7 +268,6 @@ def _download_klines_api(
         time.sleep(0.1)
 
     if not all_rows:
-        print(f"  [market_data] No data returned for {symbol} {interval}")
         return None
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,14 +282,25 @@ def _auto_download(
     interval: str,
     data_dir: Path,
     registry: DataRegistry,
-    ref_df: Optional[pd.DataFrame] = None,   # align date range to primary symbol
+    ref_df: Optional[pd.DataFrame] = None,
 ) -> Optional[pd.DataFrame]:
-    """Try to download symbol from Binance API and register the result."""
+    """
+    Auto-download strategy:
+      1. Try Binance Data Vision (S3, no geo-block).
+      2. If that fails, fall back to REST API.
+    """
+    # --- Primary: Data Vision ---
+    df = _download_data_vision(symbol, interval, data_dir, registry)
+    if df is not None:
+        return df
+
+    # --- Fallback: REST API ---
+    print(f"  [market_data] Data Vision failed, trying REST API for {symbol} ...")
     if ref_df is not None:
         start_ms = int(ref_df["open_time"].min().timestamp() * 1000)
         end_ms   = int(ref_df["open_time"].max().timestamp() * 1000)
     else:
-        start_ms = int(pd.Timestamp(DEFAULT_START_DATE, tz="UTC").timestamp() * 1000)
+        start_ms = int(pd.Timestamp(f"{DEFAULT_START_YEAR}-01-01", tz="UTC").timestamp() * 1000)
         end_ms   = int(pd.Timestamp.utcnow().timestamp() * 1000)
 
     save_path = data_dir / f"{symbol}-{interval}-api.csv"
@@ -339,21 +407,6 @@ def load_and_enrich(
     auto_download: bool = True,
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Discover -> (auto-download if missing) -> load -> enrich -> cross-asset features.
-
-    Primary symbol:
-      - If local file found: load it.
-      - If not found and auto_download=True: download from Binance API (2020-01-01 -> now).
-      - If download fails: raise FileNotFoundError with full instructions.
-
-    Correlated symbols:
-      - Same logic, but failure is non-fatal (skipped with a warning).
-
-    Returns:
-        df        : enriched DataFrame
-        feat_cols : feature column names to pass to the model
-    """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     registry = DataRegistry(data_dir)
@@ -365,7 +418,7 @@ def load_and_enrich(
     df = load_symbol(symbol, interval, registry)
     if df is None:
         if auto_download:
-            print(f"[market_data] {symbol} {interval} not found locally. Downloading from Binance API ...")
+            print(f"[market_data] {symbol} {interval} not found locally. Auto-downloading ...")
             df = _auto_download(symbol, interval, data_dir, registry)
         if df is None:
             _print_missing_instructions(symbol, interval, data_dir)
@@ -386,7 +439,7 @@ def load_and_enrich(
             cdf = _auto_download(csym, interval, data_dir, registry, ref_df=df)
         if cdf is None:
             if verbose:
-                print(f"  [market_data] WARNING: {csym} {interval} unavailable, skipping.")
+                print(f"  [market_data] WARNING: {csym} unavailable, skipping corr features.")
             continue
         corr_dfs[csym] = enrich_features(cdf)
 
@@ -418,36 +471,33 @@ def load_and_enrich(
 def _print_missing_instructions(symbol: str, interval: str, data_dir: Path, is_corr: bool = False):
     tag = "WARNING" if is_corr else "ERROR"
     print(f"\n{'='*60}")
-    print(f"[market_data] {tag}: {symbol} {interval} data not found and auto-download failed")
+    print(f"[market_data] {tag}: {symbol} {interval} - auto-download failed")
     print(f"{'='*60}")
-    print(f"Manual option - Binance Data Vision:")
-    print(f"  1. https://data.binance.vision/")
-    print(f"  2. data/spot/monthly/klines/{symbol}/{interval}/")
-    print(f"  3. Place ZIP files in: {data_dir.resolve()}/")
-    print(f"  4. Filename: {symbol}-{interval}-YYYY-MM.zip")
+    print(f"Manual fallback - Binance Data Vision:")
+    print(f"  1. https://data.binance.vision/data/spot/monthly/klines/{symbol}/{interval}/")
+    print(f"  2. Download ZIP files and place in: {data_dir.resolve()}/")
     print(f"{'='*60}\n")
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI: python -m casa_rnn.market_data --symbol BTCUSDT --interval 1h
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Download market data from Binance public API")
-    parser.add_argument("--symbol",   default="BTCUSDT")
-    parser.add_argument("--interval", default="1h")
-    parser.add_argument("--start",    default=DEFAULT_START_DATE)
-    parser.add_argument("--end",      default=None)
-    parser.add_argument("--data-dir", default="data")
+    parser = argparse.ArgumentParser(description="Download market data via Binance Data Vision")
+    parser.add_argument("--symbol",     default="BTCUSDT")
+    parser.add_argument("--interval",   default="1h")
+    parser.add_argument("--start-year", default=DEFAULT_START_YEAR, type=int)
+    parser.add_argument("--data-dir",   default="data")
     args = parser.parse_args()
 
-    start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
-    end_ms   = int((pd.Timestamp(args.end, tz="UTC") if args.end
-                    else pd.Timestamp.utcnow()).timestamp() * 1000)
     out_dir  = Path(args.data_dir)
-    out_path = out_dir / f"{args.symbol}-{args.interval}-api.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    reg = DataRegistry(out_dir)
 
-    result = _download_klines_api(args.symbol, args.interval, start_ms, end_ms, out_path)
-    if result is not None:
-        print(f"Done: {len(result):,} candles for {args.symbol} {args.interval}")
+    df = _download_data_vision(args.symbol, args.interval, out_dir, reg, start_year=args.start_year)
+    if df is not None:
+        print(f"Done: {len(df):,} candles for {args.symbol} {args.interval}")
+    else:
+        print("Download failed.")
