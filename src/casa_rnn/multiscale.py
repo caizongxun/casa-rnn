@@ -7,6 +7,7 @@ Changelog:
        - Learnable hyperparameters optimised by gradient:
            log_regime_thresh, log_decay_rate, log_tda_w, log_cereb_w,
            log_regime_loss_w  (all exposed via properties with clamping)
+  v0.8.1 - NaN guard on danger_score before slow_update_every int cast
 """
 import math
 import torch
@@ -137,6 +138,12 @@ class MultiScaleCASARNN(nn.Module):
         h_norm = h.norm(dim=-1, keepdim=True) / (h.shape[-1] ** 0.5)  # (B,1)
         return torch.cat([h_mean, h_std, h_norm], dim=-1).unsqueeze(1) # (B,1,3)
 
+    @staticmethod
+    def _safe_scalar(t: torch.Tensor, fallback: float = 0.0) -> float:
+        """Return tensor mean as float; fall back to `fallback` if NaN/Inf."""
+        val = t.mean().item()
+        return fallback if (math.isnan(val) or math.isinf(val)) else val
+
     def forward(
         self,
         x: torch.Tensor,
@@ -240,7 +247,10 @@ class MultiScaleCASARNN(nn.Module):
 
                 self.danger_det.update(fused)
                 danger_score = self.danger_det(fused)
-                max_danger   = torch.max(max_danger, danger_score.mean().detach())
+                # v0.8.1: NaN/Inf guard — if hidden state is polluted (e.g. early
+                # NaN features), fall back to 0 so int() cast never fails.
+                danger_mean = self._safe_scalar(danger_score, fallback=0.0)
+                max_danger  = torch.max(max_danger, torch.tensor(danger_mean, device=device))
 
                 if delta > thresh:
                     hidden['slow'] = (
@@ -248,7 +258,7 @@ class MultiScaleCASARNN(nn.Module):
                         self.danger_det.selective_reset(hidden['slow'][1], danger_score),
                     )
 
-                slow_update_every = max(1, int(3.0 / (1.0 + 3.0 * danger_score.mean().item())))
+                slow_update_every = max(1, int(3.0 / (1.0 + 3.0 * danger_mean)))
 
                 # v0.8: tda mix uses learnable weight
                 fused = fused + self.tda_w * tda_h_base
