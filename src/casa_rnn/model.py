@@ -13,17 +13,22 @@ class CASARNNModel(nn.Module):
 
         raw_input
             |
-        FeatureGenome  (optional, auto feature evolution)
+        FeatureGenome  (auto feature evolution)
             |
         MultiScaleCASARNN
+          |- CASARNNCell (fast/mid/slow)
+          |- Scale fusion
+          |- ThalamicAttention    [NEW: deep integration]
+          |- NeuromodulatorGating [NEW: deep integration]
+          |- PrefrontalWorkingMemory [NEW: deep integration]
+          |- MemoryBank read
+          |- UncertaintyGatedHead
             |
         (mean, std, extra)
 
     Two-stage regime loop:
-    - Stage 1: forward pass with uniform regime (no prior)
-    - Stage 2: use Stage-1 regime signal to condition TemporalGenome
-    This allows the genome's lag selection to be regime-aware without
-    requiring a separate pretrained regime predictor.
+    - Stage 1: forward pass with uniform regime
+    - Stage 2: genome conditioned on Stage-1 regime signal
     """
 
     def __init__(
@@ -37,6 +42,7 @@ class CASARNNModel(nn.Module):
         dropout:       float = 0.1,
         use_memory:    bool  = True,
         memory_slots:  int   = 32,
+        use_bio:       bool  = True,    # wire bio modules into RNN
     ):
         super().__init__()
         self.use_genome = use_genome
@@ -54,6 +60,7 @@ class CASARNNModel(nn.Module):
             dropout=dropout,
             use_memory=use_memory,
             memory_slots=memory_slots,
+            use_bio=use_bio,
         )
 
     def forward(
@@ -61,19 +68,11 @@ class CASARNNModel(nn.Module):
         x_raw: torch.Tensor,
         vol_indicator: Optional[torch.Tensor] = None,
     ):
-        """
-        Two-stage forward:
-        Stage 1 — RNN with raw/uniform features to get initial regime
-        Stage 2 — Genome uses Stage-1 regime to condition lag selection
-        """
         if self.use_genome:
-            # Stage 1: quick pass to get regime signal
             with torch.no_grad():
                 z0 = self.genome(x_raw, regime=None)
                 _, _, extra0 = self.rnn(z0, vol_indicator)
-                regime_signal = extra0["regime_probs"].mean(-1, keepdim=True)  # (B,T,1)
-
-            # Stage 2: genome conditioned on regime
+                regime_signal = extra0["regime_probs"].mean(-1, keepdim=True)
             z = self.genome(x_raw, regime=regime_signal.detach())
         else:
             z = x_raw
@@ -81,7 +80,6 @@ class CASARNNModel(nn.Module):
         return self.rnn(z, vol_indicator)
 
     def get_feature_report(self) -> dict:
-        """What features has the genome evolved? Call after training."""
         if not self.use_genome:
             return {"genome": "disabled"}
         return self.genome.get_evolved_feature_report()
