@@ -9,9 +9,6 @@ Bio-neuro integration (deep):
   3. PrefrontalWorkingMemory - maintains orthogonal context/content subspaces
                                with RPE-controlled input gate
   4. MemoryBank read (existing, now reads from bio-modulated h)
-
-This is the full integration loop - all four modules affect the actual
-computation graph, not just demonstrate their API.
 """
 import torch
 import torch.nn as nn
@@ -33,8 +30,8 @@ class MultiScaleCASARNN(nn.Module):
         memory_slots: int = 32,
         regime_reset_threshold: float = 0.15,
         hidden_decay_rate: float = 0.3,
-        use_bio: bool = True,          # enable bio-neuro modules
-        context_size: int = 2,         # regime + vol
+        use_bio: bool = True,
+        context_size: int = 2,
     ):
         super().__init__()
         self.hidden_size            = hidden_size
@@ -53,14 +50,10 @@ class MultiScaleCASARNN(nn.Module):
             nn.Linear(hidden_size, 3),
         )
 
-        # --- Bio modules (deep integration) ---
         if use_bio:
-            # 1. Thalamic gate: top-down suppression before neuromodulation
-            self.thal_attn = ThalamicAttention(hidden_size, context_size)
-            # 2. Neuromodulator: DA/ACh/NE/5HT adjusts h after thalamic gate
+            self.thal_attn  = ThalamicAttention(hidden_size, context_size)
             self.neuro_gate = NeuromodulatorGating(hidden_size, context_size)
-            # 3. PFC working memory: orthogonal context/content + RPE gate
-            self.pfc_wm = PrefrontalWorkingMemory(hidden_size, context_dim=hidden_size // 4)
+            self.pfc_wm     = PrefrontalWorkingMemory(hidden_size, context_dim=hidden_size // 4)
 
         if use_memory:
             self.memory = MemoryBank(
@@ -126,44 +119,39 @@ class MultiScaleCASARNN(nn.Module):
 
             total_pred_err = total_pred_err + pe_f.mean() + pe_m.mean() + pe_s.mean()
 
-            # Scale fusion
+            # Scale fusion -> fused: (B, H)
             concat  = torch.cat([hf_f, hf_m, hf_s], dim=-1)
             weights = torch.softmax(self.scale_attn(concat), dim=-1)
             fused   = (weights[:, 0:1] * hf_f +
                        weights[:, 1:2] * hf_m +
                        weights[:, 2:3] * hf_s)
-            fused   = self.dropout(fused)   # (B, H)
+            fused   = self.dropout(fused)
 
-            # --- Deep bio integration ---
             if self.use_bio:
-                # Build context vector: (regime, vol) -> (B, 1, 2) for modules
-                # Unsqueeze T dim since modules expect (B, T, *)
-                regime_t = regime_mean.unsqueeze(-1)  # (B, 1)
+                # ctx: (B, 1, 2)  regime + vol
+                regime_t = regime_mean.unsqueeze(-1)          # (B, 1)
                 vol_t    = vt if vt is not None else torch.zeros_like(regime_t)
-                # vol_t may be (B, 1); match shape
-                ctx = torch.cat([regime_t, vol_t], dim=-1).unsqueeze(1)  # (B, 1, 2)
-                h_t = fused.unsqueeze(1)                                 # (B, 1, H)
+                ctx  = torch.cat([regime_t, vol_t], dim=-1).unsqueeze(1)   # (B, 1, 2)
+                h_t  = fused.unsqueeze(1)                                  # (B, 1, H)
 
-                # 1. ThalamicAttention: top-down suppression
-                #    Gate shuts irrelevant channels based on current regime
-                h_t = self.thal_attn(h_t, ctx)                           # (B, 1, H)
+                # 1. ThalamicAttention
+                h_t = self.thal_attn(h_t, ctx)                            # (B, 1, H)
 
-                # 2. NeuromodulatorGating: DA/ACh/NE/5HT modulation
-                #    DA gate opens on high RPE (surprise)
-                #    NE scales gain with volatility
-                h_t, neuro_levels = self.neuro_gate(h_t, ctx)            # (B, 1, H)
+                # 2. NeuromodulatorGating
+                h_t, neuro_levels = self.neuro_gate(h_t, ctx)             # (B, 1, H)
 
-                # 3. PrefrontalWorkingMemory: orthogonal context/content
-                #    RPE = magnitude of prediction error so far
-                rpe_t = (pe_f + pe_m + pe_s).unsqueeze(1).unsqueeze(1) / 3.0  # (B, 1, 1)
-                h_t   = self.pfc_wm(h_t, rpe=rpe_t)                     # (B, 1, H)
+                # 3. PrefrontalWorkingMemory
+                # pe_f/pe_m/pe_s are scalars (B,) after .mean() in cell
+                # rpe_t must be 3D: (B, 1, 1) to concat with h_t (B, 1, H)
+                rpe_scalar = (pe_f + pe_m + pe_s) / 3.0       # (B,)
+                rpe_t = rpe_scalar.unsqueeze(1).unsqueeze(1)   # (B, 1, 1)
+                h_t   = self.pfc_wm(h_t, rpe=rpe_t)           # (B, 1, H)
 
-                fused = h_t.squeeze(1)                                   # (B, H)
+                fused = h_t.squeeze(1)                         # (B, H)
 
                 for k, v in neuro_levels.items():
                     all_neuro[k].append(v)
 
-            # Memory read (now reads from bio-modulated h)
             if self.use_memory:
                 self.memory.write(fused, regime_mean)
                 fused = self.memory.read(fused, regime_mean)
@@ -181,7 +169,6 @@ class MultiScaleCASARNN(nn.Module):
         regime  = torch.cat(all_regime, dim=1)
         scale_w = torch.cat(all_scale_weights, dim=1)
 
-        # Average neuro levels over timesteps for logging
         neuro_summary = {k: (sum(v) / len(v) if v else 0.0)
                          for k, v in all_neuro.items()}
 
