@@ -22,7 +22,8 @@ Binance Data Vision CSV columns (fixed order):
 Timestamp note:
   Binance Data Vision files before 2025 use millisecond timestamps (13 digits).
   Files from 2025 onwards use second timestamps (10 digits).
-  _read_bdv_csv auto-detects the unit based on the magnitude of the first value.
+  _read_bdv_csv auto-detects the unit based on the magnitude of the first value,
+  then validates the result falls within a sane year range (2010-2030).
 """
 
 from __future__ import annotations
@@ -59,6 +60,10 @@ DEFAULT_START_YEAR   = 2020
 # Threshold: timestamps >= this are treated as milliseconds, otherwise seconds.
 # 1e12 ms = year ~2001, 1e10 s = year ~2286 (safe upper bound for seconds).
 _MS_THRESHOLD = 1_000_000_000_000   # 10^12
+
+# Sane timestamp bounds for validation after parsing
+_MIN_VALID_TS = pd.Timestamp("2010-01-01", tz="UTC")
+_MAX_VALID_TS = pd.Timestamp("2035-01-01", tz="UTC")
 
 
 # ---------------------------------------------------------------------------
@@ -113,11 +118,27 @@ class DataRegistry:
 def _parse_timestamp_col(series: pd.Series) -> pd.Series:
     """
     Convert a numeric timestamp series to UTC datetime.
-    Auto-detects milliseconds (13-digit) vs seconds (10-digit).
+    Auto-detects milliseconds (13-digit) vs seconds (10-digit), then
+    validates the parsed result falls within a sane year range.
+    If the heuristic guess produces out-of-range values, the other unit is tried.
     """
     first_valid = series.dropna().iloc[0] if not series.dropna().empty else 0
-    unit = "ms" if first_valid >= _MS_THRESHOLD else "s"
-    return pd.to_datetime(series, unit=unit, utc=True)
+    guessed_unit = "ms" if first_valid >= _MS_THRESHOLD else "s"
+    fallback_unit = "s" if guessed_unit == "ms" else "ms"
+
+    for unit in (guessed_unit, fallback_unit):
+        try:
+            parsed = pd.to_datetime(series, unit=unit, utc=True, errors="coerce")
+            valid_mask = parsed.notna()
+            if valid_mask.any():
+                sample = parsed[valid_mask].iloc[0]
+                if _MIN_VALID_TS <= sample <= _MAX_VALID_TS:
+                    return parsed
+        except Exception:
+            continue
+
+    # Last resort: return NaT series so caller can drop
+    return pd.to_datetime(series, unit="ms", utc=True, errors="coerce")
 
 
 def _read_bdv_csv(path: Path) -> pd.DataFrame:
@@ -146,8 +167,10 @@ def _read_bdv_csv(path: Path) -> pd.DataFrame:
 
     df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
     df = df.dropna(subset=["open_time"])
-    # Auto-detect ms vs s
     df["open_time"] = _parse_timestamp_col(df["open_time"])
+    # Drop rows where timestamp parsing failed or fell outside sane range
+    df = df.dropna(subset=["open_time"])
+    df = df[(df["open_time"] >= _MIN_VALID_TS) & (df["open_time"] <= _MAX_VALID_TS)]
 
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -461,10 +484,25 @@ def load_and_enrich(
     corr_feats = [c for c in df.columns if c.startswith(("corr_", "rel_mom_"))]
     feat_cols  = [f for f in base_feats + corr_feats if f in df.columns]
 
+    # Final NaN guard: drop any row that has NaN in any feature column
+    before = len(df)
+    df = df.dropna(subset=feat_cols).reset_index(drop=True)
+    dropped = before - len(df)
+
     if verbose:
-        print(f"\n[market_data] {symbol} {interval}  rows={len(df):,}")
+        print(f"\n[market_data] {symbol} {interval}  rows={len(df):,}" +
+              (f"  (dropped {dropped} NaN rows)" if dropped > 0 else ""))
         print(f"[market_data] Correlated: {list(corr_dfs.keys())}")
         print(f"[market_data] Features ({len(feat_cols)}): {feat_cols}")
+
+    # Sanity check: abort early if features still contain NaN
+    nan_counts = df[feat_cols].isna().sum()
+    nan_cols = nan_counts[nan_counts > 0]
+    if not nan_cols.empty:
+        raise ValueError(
+            f"[market_data] NaN remains in features after dropna — "
+            f"this will cause NaN in model output:\n{nan_cols}"
+        )
 
     df = df.dropna(subset=["close", "log_return"]).reset_index(drop=True)
     return df, feat_cols
