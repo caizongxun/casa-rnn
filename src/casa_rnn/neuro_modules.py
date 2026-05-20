@@ -4,7 +4,7 @@ Bio-inspired neuromodulation + SoftModuleRouter.
 Changelog:
   - SoftModuleRouter: regime_consistency_loss() uses median split
   - ContrastiveStateRegularizer: uses median split
-  - Fix CT: neg_loss direction corrected to -sim_neg.mean()
+  - Fix CT v2: pos=-sim, neg=+sim (correct InfoNCE direction)
 """
 
 import torch
@@ -300,6 +300,13 @@ class SoftModuleRouter(nn.Module):
 
 
 class ContrastiveStateRegularizer(nn.Module):
+    """
+    InfoNCE-style contrastive loss over hidden states split by market regime.
+
+    Correct sign convention (v2):
+      pos_loss = -sim(anchor, same_regime)   <- minimize = pull together
+      neg_loss = +sim(anchor, diff_regime)   <- minimize = push apart
+    """
     def __init__(self, temperature: float = 0.5):
         super().__init__()
         self.tau = temperature
@@ -317,13 +324,14 @@ class ContrastiveStateRegularizer(nn.Module):
         h_low   = F.normalize(h_flat[low_mask.reshape(-1)],  dim=-1)
         h_high  = F.normalize(h_flat[high_mask.reshape(-1)], dim=-1)
 
-        anchor_low  = h_low.mean(dim=0, keepdim=True)
-        anchor_high = h_high.mean(dim=0, keepdim=True)
+        anchor_low  = h_low.mean(dim=0, keepdim=True)   # (1, H)
+        anchor_high = h_high.mean(dim=0, keepdim=True)  # (1, H)
 
-        # Fix CT: neg_loss must also be negative (penalise high cross-regime sim)
-        pos_loss  = -(anchor_low  * h_low).sum(dim=-1).mean()  / self.tau
-        neg_loss  = -(anchor_low  * h_high).sum(dim=-1).mean() / self.tau * (-1)  # push apart
-        pos_loss2 = -(anchor_high * h_high).sum(dim=-1).mean() / self.tau
-        neg_loss2 = -(anchor_high * h_low).sum(dim=-1).mean()  / self.tau * (-1)
+        # pos: negative similarity -> loss goes down as same-regime states align
+        # neg: positive similarity -> loss goes down as cross-regime states diverge
+        pos_low  = -(anchor_low  * h_low ).sum(dim=-1).mean() / self.tau
+        neg_low  = +(anchor_low  * h_high).sum(dim=-1).mean() / self.tau
+        pos_high = -(anchor_high * h_high).sum(dim=-1).mean() / self.tau
+        neg_high = +(anchor_high * h_low ).sum(dim=-1).mean() / self.tau
 
-        return (pos_loss + neg_loss + pos_loss2 + neg_loss2) * 0.25
+        return (pos_low + neg_low + pos_high + neg_high) * 0.25

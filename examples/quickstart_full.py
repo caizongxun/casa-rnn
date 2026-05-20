@@ -4,8 +4,8 @@ Full CASA-RNN quickstart — all modules active, SoftModuleRouter governs tradeo
 Changelog:
   - Router sparsity weight: 0.05
   - Fix Router T: log_temperature split into separate param group with lr=5e-3
-  - Fix CT direction in neuro_modules.py
-  - Fix Danger normalization in danger.py
+  - Fix CT v2: correct InfoNCE sign in neuro_modules.py
+  - Fix RC: regime_consistency_loss weight 0.01 -> 0.05
 """
 import torch
 import torch.optim as optim
@@ -73,7 +73,6 @@ bio_loss_fn = BioConstraintLoss(ne_weight=0.05, da_weight=0.05)
 
 alpha_params = [model.genome.soft_op.alpha]
 
-# Fix Router T: log_temperature 獨立拆出來，給更高 lr 讓 temperature 更容易下降
 log_temp_params = [model.rnn.router.log_temperature]
 router_net_params = [
     p for n, p in model.rnn.router.named_parameters()
@@ -88,7 +87,7 @@ optimizer = optim.AdamW([
     {'params': other_params,      'lr': 3e-4},
     {'params': alpha_params,      'lr': 3e-3,  'weight_decay': 0.0},
     {'params': router_net_params, 'lr': 1e-3,  'weight_decay': 0.0},
-    {'params': log_temp_params,   'lr': 5e-3,  'weight_decay': 0.0},  # temperature 快速響應
+    {'params': log_temp_params,   'lr': 5e-3,  'weight_decay': 0.0},
 ], weight_decay=1e-4)
 
 loss_fn   = CounterfactualLoss(alpha=0.1, beta=0.01, gamma=0.05, use_nll=True, nll_clamp=3.0, regime_scale=True)
@@ -144,7 +143,7 @@ for step in range(TOTAL):
             loss = loss + 0.05 * model.rnn.router.sparsity_loss(rw_full)
             rc_loss = extra.get("regime_consistency_loss", None)
             if rc_loss is not None:
-                loss = loss + 0.01 * rc_loss
+                loss = loss + 0.05 * rc_loss  # RC weight: 0.01 -> 0.05
 
     ct_loss = extra.get("contrastive_loss", None)
     if ct_loss is not None:
