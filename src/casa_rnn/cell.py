@@ -9,6 +9,10 @@ Changelog:
            pe_target = sigmoid(pred_error * pe_scale) normalises to (0,1)
            regime_self_loss = BCE(regime_scalar, pe_target) added to return
            regime_entropy_bonus pushes regime away from 0.5 collapse
+  v0.7.1 - guard pe_target and regime_scalar against nan/inf before BCE.
+           Wider input dims (e.g. 31 corr features) can cause grad explosion
+           on the first few steps; clamp pred_error before sigmoid to stop
+           nan propagation.
 """
 import torch
 import torch.nn as nn
@@ -96,17 +100,25 @@ class CASARNNCell(nn.Module):
         pred_error  = (h_fast_new - h_fast_pred).pow(2).mean(dim=-1, keepdim=True)  # (B,1)
 
         # --- v0.7: self-supervised regime loss ---
-        # Map pred_error to (0,1): high error -> target 1.0 (regime change)
-        pe_target = torch.sigmoid(pred_error.detach() * self.pe_scale)  # (B,1)
-        regime_self_loss = F.binary_cross_entropy(
-            regime_scalar.unsqueeze(-1).clamp(1e-6, 1-1e-6),
-            pe_target,
-            reduction="mean",
-        )
-        # Entropy bonus: -H(p) penalises staying at 0.5
-        # We MINIMISE -H so regime_head is pushed to be decisive
-        p = regime_scalar.clamp(1e-6, 1-1e-6)
-        entropy_bonus = (p * p.log() + (1-p) * (1-p).log()).mean()  # negative entropy
+        # Clamp pred_error before sigmoid to prevent nan from gradient explosion
+        # at init when input dimensionality is large (e.g. 31 corr features).
+        pred_error_safe = pred_error.detach().clamp(0.0, 100.0)
+        pe_target = torch.sigmoid(pred_error_safe * self.pe_scale)  # (B,1)  in (0,1)
+
+        # Guard both inputs to BCE against nan/inf
+        rs_safe = regime_scalar.unsqueeze(-1).clamp(1e-6, 1 - 1e-6)
+        pt_safe = pe_target.clamp(1e-6, 1 - 1e-6)
+
+        # Replace any residual nan/inf with safe defaults
+        rs_safe = torch.nan_to_num(rs_safe, nan=0.5, posinf=1 - 1e-6, neginf=1e-6)
+        pt_safe = torch.nan_to_num(pt_safe, nan=0.5, posinf=1 - 1e-6, neginf=1e-6)
+
+        regime_self_loss = F.binary_cross_entropy(rs_safe, pt_safe, reduction="mean")
+
+        # Entropy bonus: pushes regime_head to be decisive (avoid 0.5 collapse)
+        p = regime_scalar.clamp(1e-6, 1 - 1e-6)
+        p = torch.nan_to_num(p, nan=0.5)
+        entropy_bonus = (p * p.log() + (1 - p) * (1 - p).log()).mean()
         regime_loss = self.regime_loss_weight * regime_self_loss + 0.1 * entropy_bonus
 
         h_fast_new = self.dropout(h_fast_new)
