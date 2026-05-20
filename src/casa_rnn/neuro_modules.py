@@ -4,13 +4,17 @@ Bio-inspired neuromodulation + SoftModuleRouter + LatentExpertBank.
 Changelog:
   v0.4 - SoftModuleRouter: regime_consistency_loss() uses median split
        - ContrastiveStateRegularizer: uses median split
-       - Fix CT v2: pos=-sim, neg=+sim (correct InfoNCE direction)
-  v0.5 - NeuromodulatorGating: ctx_encoder receives rolling z-score of context
-         so DA/NE respond to deviation from local baseline, not absolute value
-       - SoftModuleRouter.regime_consistency_loss: median split -> ±0.5σ z-score
-         threshold; only genuinely extreme regime samples participate
-       - ContrastiveStateRegularizer: same ±0.5σ threshold
-       - LatentExpertBank: K=4 unsupervised GRU experts complement bio modules
+  v0.5 - NeuromodulatorGating: ctx z-score (later found broken, see v0.7.1)
+       - SoftModuleRouter/ContrastiveStateRegularizer: ±0.5σ threshold
+       - LatentExpertBank: K=4 GRU experts
+  v0.7.1 - HomeostaticGainControl: da_set/ne_set setpoints REMOVED as loss
+           targets. homeostatic_loss() now returns 0. The L2 penalty was
+           anchoring DA to 0.55 regardless of any other gradient signal.
+         - NeuromodulatorGating: removed broken _zscore_context call.
+           ctx is passed raw to ctx_encoder; variance comes from timestep
+           differences, not batch-level normalisation.
+         - ctx_encoder sigmoid scaling reduced 2.5/3.5 -> 1.0 to avoid
+           saturating sigmoid near initialisation.
 """
 
 import torch
@@ -21,30 +25,8 @@ from typing import Optional, Tuple
 import random
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _zscore_context(ctx: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Normalise context features by their own mean/std across the batch.
-    This converts absolute values (vol, regime, vov) into deviations from the
-    current batch baseline, making neuromodulator gating sensitive to *change*
-    rather than absolute level.
-    """
-    mu  = ctx.mean(dim=0, keepdim=True)
-    std = ctx.std(dim=0, keepdim=True).clamp(min=eps)
-    return (ctx - mu) / std
-
-
 def _zscore_masks(reg_scalar: torch.Tensor, threshold: float = 0.5
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return (low_mask, high_mask) where each element is True only for samples
-    whose regime scalar deviates by at least `threshold` standard deviations
-    from the batch mean.  Replaces the old median-split which produced
-    uninformative equal-sized halves.
-    """
     flat = reg_scalar.reshape(-1)
     mu   = flat.mean()
     std  = flat.std().clamp(min=1e-6)
@@ -53,11 +35,13 @@ def _zscore_masks(reg_scalar: torch.Tensor, threshold: float = 0.5
     return low_mask, high_mask
 
 
-# ---------------------------------------------------------------------------
-# NeuromodulatorGating  (v0.5: z-score normalised context)
-# ---------------------------------------------------------------------------
-
 class NeuromodulatorGating(nn.Module):
+    """
+    v0.7.1: removed broken batch z-score on ctx.
+    ctx is passed raw; meaningful variance is across timesteps (T dimension)
+    which naturally flows through when ctx is built from live regime_scalar.
+    Sigmoid scaling reduced to 1.0 to avoid saturation at init.
+    """
     def __init__(self, hidden_size: int, context_size: int = 3):
         super().__init__()
         self.hidden_size = hidden_size
@@ -70,29 +54,26 @@ class NeuromodulatorGating(nn.Module):
         self.ach_proj  = nn.Linear(hidden_size, hidden_size)
         self.ne_gain   = nn.Linear(hidden_size, hidden_size)
         self.sht_decay = nn.Linear(hidden_size, hidden_size)
-        self.norm = nn.LayerNorm(hidden_size)
+        self.norm      = nn.LayerNorm(hidden_size)
 
     def forward(self, h: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        # v0.5: normalise context before encoding so neuromodulators respond to
-        # deviation from the current batch baseline, not absolute values
-        ctx_shape = context.shape
-        ctx_flat  = context.reshape(-1, ctx_shape[-1])
-        ctx_norm  = _zscore_context(ctx_flat).reshape(ctx_shape)
+        # v0.7.1: raw ctx, no z-score (z-score across batch was a no-op)
+        raw = self.ctx_encoder(context)
+        # reduced scaling 2.5/3.5 -> 1.0 to keep sigmoid in linear regime at init
+        da  = torch.sigmoid(raw[..., 0:1])
+        ach = torch.sigmoid(raw[..., 1:2])
+        ne  = torch.sigmoid(raw[..., 2:3])
+        sht = torch.sigmoid(raw[..., 3:4])
 
-        raw = self.ctx_encoder(ctx_norm)
-        da  = torch.sigmoid(raw[..., 0:1] * 2.5)
-        ach = torch.sigmoid(raw[..., 1:2] * 2.0)
-        ne  = torch.sigmoid(raw[..., 2:3] * 3.5)
-        sht = torch.sigmoid(raw[..., 3:4] * 2.0)
-        plastic  = torch.sigmoid(self.da_gate(h))
-        h        = (1.0 - da) * h + da * plastic
-        h_sharp  = torch.tanh(self.ach_proj(h))
-        h        = h + ach * 1.5 * (h_sharp - h.mean(dim=-1, keepdim=True))
-        gain     = 0.25 + 2.5 * ne
-        h        = h * gain + 0.1 * ne * torch.tanh(self.ne_gain(h))
-        smooth   = torch.tanh(self.sht_decay(h))
-        h        = sht * h + (1.0 - sht) * smooth
-        h        = self.norm(h)
+        plastic = torch.sigmoid(self.da_gate(h))
+        h       = (1.0 - da) * h + da * plastic
+        h_sharp = torch.tanh(self.ach_proj(h))
+        h       = h + ach * 1.5 * (h_sharp - h.mean(dim=-1, keepdim=True))
+        gain    = 0.25 + 2.5 * ne
+        h       = h * gain + 0.1 * ne * torch.tanh(self.ne_gain(h))
+        smooth  = torch.tanh(self.sht_decay(h))
+        h       = sht * h + (1.0 - sht) * smooth
+        h       = self.norm(h)
         return h, {
             "dopamine":           da.detach(),
             "acetylcholine":      ach.detach(),
@@ -104,10 +85,6 @@ class NeuromodulatorGating(nn.Module):
             "serotonin_raw":      sht,
         }
 
-
-# ---------------------------------------------------------------------------
-# ThalamicAttention  (unchanged)
-# ---------------------------------------------------------------------------
 
 class ThalamicAttention(nn.Module):
     def __init__(self, hidden_size: int, context_size: int = 3):
@@ -123,10 +100,6 @@ class ThalamicAttention(nn.Module):
         gate = self.trn(context)
         return self.norm(h + gate * torch.tanh(self.relay(h)))
 
-
-# ---------------------------------------------------------------------------
-# HippocampalReplayBuffer  (unchanged)
-# ---------------------------------------------------------------------------
 
 class HippocampalReplayBuffer:
     def __init__(self, capacity: int = 500, replay_every: int = 20):
@@ -156,10 +129,6 @@ class HippocampalReplayBuffer:
         return len(self.buffer)
 
 
-# ---------------------------------------------------------------------------
-# PrefrontalWorkingMemory  (unchanged)
-# ---------------------------------------------------------------------------
-
 class PrefrontalWorkingMemory(nn.Module):
     def __init__(self, hidden_size: int, context_dim: int = 16):
         super().__init__()
@@ -181,10 +150,6 @@ class PrefrontalWorkingMemory(nn.Module):
         h_new      = in_gate * torch.tanh(self.merge(h_combined)) + (1 - in_gate) * h
         return self.norm(self.output_gate(h_new) * h_new)
 
-
-# ---------------------------------------------------------------------------
-# MetaLearningStrategyBank  (unchanged)
-# ---------------------------------------------------------------------------
 
 STRATEGY_NAMES = ["rehearsal", "chunking", "associative", "contrastive", "slow"]
 
@@ -231,10 +196,6 @@ class MetaLearningStrategyBank(nn.Module):
         return -(w_mean * w_mean.log()).sum()
 
 
-# ---------------------------------------------------------------------------
-# RegimeTransitionDetector  (unchanged)
-# ---------------------------------------------------------------------------
-
 class RegimeTransitionDetector(nn.Module):
     def __init__(self, hidden_size: int, window: int = 8):
         super().__init__()
@@ -261,10 +222,6 @@ class RegimeTransitionDetector(nn.Module):
         return F.binary_cross_entropy(trans_prob, target)
 
 
-# ---------------------------------------------------------------------------
-# CerebellarForwardModel  (unchanged)
-# ---------------------------------------------------------------------------
-
 class CerebellarForwardModel(nn.Module):
     def __init__(self, hidden_size: int, input_size: int, proj_size: int = 32):
         super().__init__()
@@ -286,19 +243,18 @@ class CerebellarForwardModel(nn.Module):
         return (h_pred - h_next.detach()).pow(2).mean(dim=-1, keepdim=True)
 
 
-# ---------------------------------------------------------------------------
-# HomeostaticGainControl  (unchanged)
-# ---------------------------------------------------------------------------
-
 class HomeostaticGainControl(nn.Module):
+    """
+    v0.7.1: setpoint loss DISABLED.
+    Previously homeostatic_loss() penalised DA deviating from da_set=0.55,
+    which hard-anchored DA regardless of any other gradient. Now it returns 0.
+    EMA tracking is kept for monitoring only.
+    """
     def __init__(self, da_set: float = 0.55, ne_set: float = 0.35, sht_set: float = 0.50,
-                 ema_alpha: float = 0.02, penalty_weight: float = 0.03):
+                 ema_alpha: float = 0.02, penalty_weight: float = 0.0):  # weight=0
         super().__init__()
-        self.da_set  = da_set
-        self.ne_set  = ne_set
-        self.sht_set = sht_set
-        self.alpha   = ema_alpha
-        self.weight  = penalty_weight
+        self.alpha  = ema_alpha
+        self.weight = penalty_weight  # 0.0 -- disabled
         self.register_buffer("da_ema",  torch.tensor(da_set))
         self.register_buffer("ne_ema",  torch.tensor(ne_set))
         self.register_buffer("sht_ema", torch.tensor(sht_set))
@@ -310,27 +266,11 @@ class HomeostaticGainControl(nn.Module):
         self.sht_ema = (1 - self.alpha) * self.sht_ema + self.alpha * sht_mean
 
     def homeostatic_loss(self, da: torch.Tensor, ne: torch.Tensor, sht: torch.Tensor) -> torch.Tensor:
-        l_da  = (da.mean()  - self.da_set).pow(2)
-        l_ne  = (ne.mean()  - self.ne_set).pow(2)
-        l_sht = (sht.mean() - self.sht_set).pow(2)
-        return self.weight * (l_da + l_ne + l_sht)
+        # v0.7.1: disabled -- was anchoring DA=0.55 against all other gradients
+        return torch.tensor(0.0, device=da.device)
 
-
-# ---------------------------------------------------------------------------
-# LatentExpertBank  (v0.5 NEW)
-# ---------------------------------------------------------------------------
 
 class LatentExpertBank(nn.Module):
-    """
-    K unsupervised GRU experts that learn market patterns not covered by the
-    hand-designed bio modules.  Each expert maintains its own hidden state and
-    processes the fused representation independently.  A learned router
-    (shared with SoftModuleRouter logits) selects the expert blend.
-
-    The output is a weighted sum of expert outputs, added as a residual to
-    the current fused hidden state.
-    """
-
     def __init__(self, hidden_size: int, num_experts: int = 4):
         super().__init__()
         self.num_experts = num_experts
@@ -342,48 +282,24 @@ class LatentExpertBank(nn.Module):
             nn.Linear(hidden_size // 2, num_experts),
         )
         self.norm = nn.LayerNorm(hidden_size)
-        # Per-expert hidden states managed externally via reset()
 
     def reset(self, batch: int, device: torch.device) -> list:
-        """Return fresh zero hidden states for all experts."""
         return [torch.zeros(batch, e.hidden_size, device=device) for e in self.experts]
 
-    def forward(
-        self,
-        h: torch.Tensor,
-        expert_states: list,
-    ) -> Tuple[torch.Tensor, list, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        h             : (B, H)  current fused hidden state
-        expert_states : list of K tensors (B, H)
-
-        Returns
-        -------
-        h_out         : (B, H)  residual-updated hidden state
-        new_states    : list of K updated expert hidden states
-        weights       : (B, K)  softmax expert selection weights
-        """
-        logits  = self.selector(h)                        # (B, K)
-        weights = torch.softmax(logits, dim=-1)           # (B, K)
-
-        new_states = []
+    def forward(self, h: torch.Tensor, expert_states: list) -> Tuple[torch.Tensor, list, torch.Tensor]:
+        logits  = self.selector(h)
+        weights = torch.softmax(logits, dim=-1)
+        new_states  = []
         expert_outs = []
-        for i, (expert, hs) in enumerate(zip(self.experts, expert_states)):
-            new_h = expert(h, hs)                         # (B, H)
+        for expert, hs in zip(self.experts, expert_states):
+            new_h = expert(h, hs)
             new_states.append(new_h)
             expert_outs.append(new_h)
-
-        stacked = torch.stack(expert_outs, dim=-1)        # (B, H, K)
-        blended = (stacked * weights.unsqueeze(1)).sum(-1) # (B, H)
+        stacked = torch.stack(expert_outs, dim=-1)
+        blended = (stacked * weights.unsqueeze(1)).sum(-1)
         h_out   = self.norm(h + blended)
         return h_out, new_states, weights
 
-
-# ---------------------------------------------------------------------------
-# SoftModuleRouter  (v0.5: ±0.5σ z-score threshold for RC)
-# ---------------------------------------------------------------------------
 
 MODULE_NAMES = ["thalamic", "neuromod", "pfc_wm", "strategy", "transition",
                 "cerebellum", "astrocyte", "danger", "tda", "cpg"]
@@ -418,18 +334,10 @@ class SoftModuleRouter(nn.Module):
         return (w * w.log()).sum()
 
     def regime_consistency_loss(self, weights: torch.Tensor, regime: torch.Tensor) -> torch.Tensor:
-        """
-        v0.5: replaced median split with ±0.5σ z-score threshold.
-        Only samples whose regime scalar is genuinely extreme (low or high)
-        participate.  Middle-ground samples are ignored, avoiding the
-        uninformative equal-split problem from v0.4.
-        """
-        reg_scalar        = regime[..., 0]
+        reg_scalar          = regime[..., 0]
         low_mask, high_mask = _zscore_masks(reg_scalar)
-
         loss    = torch.tensor(0.0, device=weights.device)
         n_terms = 0
-
         for mask in [low_mask, high_mask]:
             if mask.sum() < 2:
                 continue
@@ -438,54 +346,32 @@ class SoftModuleRouter(nn.Module):
             intra_var = ((w_in - w_mean.unsqueeze(0)).pow(2)).mean()
             loss      = loss + intra_var
             n_terms  += 1
-
         if low_mask.sum() > 0 and high_mask.sum() > 0:
             w_low  = weights[low_mask].mean(dim=0)
             w_high = weights[high_mask].mean(dim=0)
             sim    = F.cosine_similarity(w_low.unsqueeze(0), w_high.unsqueeze(0))
             loss   = loss + sim.squeeze() * 0.5
             n_terms += 1
-
         return loss / max(n_terms, 1)
 
 
-# ---------------------------------------------------------------------------
-# ContrastiveStateRegularizer  (v0.5: ±0.5σ z-score threshold)
-# ---------------------------------------------------------------------------
-
 class ContrastiveStateRegularizer(nn.Module):
-    """
-    InfoNCE-style contrastive loss over hidden states split by market regime.
-
-    v0.5 change: median split -> ±0.5σ z-score threshold so that only
-    genuinely different regime states are contrasted.  Samples near the
-    centre are excluded, giving the loss real discriminative power.
-
-    Sign convention (unchanged from v0.4):
-      pos_loss = -sim(anchor, same_regime)   <- pull together
-      neg_loss = +sim(anchor, diff_regime)   <- push apart
-    """
     def __init__(self, temperature: float = 0.5):
         super().__init__()
         self.tau = temperature
 
     def forward(self, hidden: torch.Tensor, regime: torch.Tensor) -> torch.Tensor:
-        reg_scalar        = regime[..., 0]
+        reg_scalar          = regime[..., 0]
         low_mask, high_mask = _zscore_masks(reg_scalar)
-
         if low_mask.sum() < 2 or high_mask.sum() < 2:
             return torch.tensor(0.0, device=hidden.device)
-
         h_flat  = hidden.reshape(-1, hidden.shape[-1])
         h_low   = F.normalize(h_flat[low_mask.reshape(-1)],  dim=-1)
         h_high  = F.normalize(h_flat[high_mask.reshape(-1)], dim=-1)
-
         anchor_low  = h_low.mean(dim=0, keepdim=True)
         anchor_high = h_high.mean(dim=0, keepdim=True)
-
         pos_low  = -(anchor_low  * h_low ).sum(dim=-1).mean() / self.tau
         neg_low  = +(anchor_low  * h_high).sum(dim=-1).mean() / self.tau
         pos_high = -(anchor_high * h_high).sum(dim=-1).mean() / self.tau
         neg_high = +(anchor_high * h_low ).sum(dim=-1).mean() / self.tau
-
         return (pos_low + neg_low + pos_high + neg_high) * 0.25
