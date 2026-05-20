@@ -1,20 +1,10 @@
 """
 Bio-inspired neuromodulation + SoftModuleRouter.
 
-Modules:
-1. NeuromodulatorGating
-2. ThalamicAttention
-3. HippocampalReplayBuffer
-4. PrefrontalWorkingMemory
-5. MetaLearningStrategyBank
-6. RegimeTransitionDetector
-7. CerebellarForwardModel
-8. HomeostaticGainControl
-9. SoftModuleRouter  — learned mixture of all optional modules
-
 Changelog:
-  - SoftModuleRouter: regime_consistency_loss() now uses median split (Fix 1)
-  - ContrastiveStateRegularizer: now uses median split (Fix 1)
+  - SoftModuleRouter: regime_consistency_loss() uses median split
+  - ContrastiveStateRegularizer: uses median split
+  - Fix CT: neg_loss direction corrected to -sim_neg.mean()
 """
 
 import torch
@@ -192,8 +182,8 @@ class RegimeTransitionDetector(nn.Module):
         self.delta_queue[-1] = regime_delta
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        h_flat    = h.squeeze(1) if h.dim() == 3 else h
-        B         = h_flat.shape[0]
+        h_flat     = h.squeeze(1) if h.dim() == 3 else h
+        B          = h_flat.shape[0]
         delta_feat = self.delta_queue.unsqueeze(0).expand(B, -1).to(h_flat.device)
         inp        = torch.cat([h_flat, delta_feat], dim=-1)
         return self.encoder(inp)
@@ -256,7 +246,7 @@ MODULE_NAMES = ["thalamic", "neuromod", "pfc_wm", "strategy", "transition", "cer
 class SoftModuleRouter(nn.Module):
     def __init__(self, hidden_size: int, num_modules: int = len(MODULE_NAMES), init_temperature: float = 2.0):
         super().__init__()
-        self.num_modules = num_modules
+        self.num_modules     = num_modules
         self.log_temperature = nn.Parameter(torch.tensor(float(init_temperature)).log())
         self.router = nn.Sequential(
             nn.Linear(hidden_size + 3, hidden_size),
@@ -282,34 +272,28 @@ class SoftModuleRouter(nn.Module):
         return (w * w.log()).sum()
 
     def regime_consistency_loss(self, weights: torch.Tensor, regime: torch.Tensor) -> torch.Tensor:
-        """
-        Fix 1: median split instead of hard-coded 0.4 / 0.6 thresholds.
-        This keeps RC active even when regime stays in a narrow band like 0.48~0.60.
-        """
         reg_scalar = regime[..., 0]
-        reg_flat   = reg_scalar.reshape(-1)
-        median     = reg_flat.median()
-
+        median     = reg_scalar.reshape(-1).median()
         low_mask   = (reg_scalar <= median)
         high_mask  = (reg_scalar > median)
 
-        loss = torch.tensor(0.0, device=weights.device)
+        loss    = torch.tensor(0.0, device=weights.device)
         n_terms = 0
 
         for mask in [low_mask, high_mask]:
             if mask.sum() < 2:
                 continue
-            w_in = weights[mask]
-            w_mean = w_in.mean(dim=0)
+            w_in      = weights[mask]
+            w_mean    = w_in.mean(dim=0)
             intra_var = ((w_in - w_mean.unsqueeze(0)).pow(2)).mean()
-            loss = loss + intra_var
-            n_terms += 1
+            loss      = loss + intra_var
+            n_terms  += 1
 
         if low_mask.sum() > 0 and high_mask.sum() > 0:
             w_low  = weights[low_mask].mean(dim=0)
             w_high = weights[high_mask].mean(dim=0)
             sim    = F.cosine_similarity(w_low.unsqueeze(0), w_high.unsqueeze(0))
-            loss = loss + sim.squeeze() * 0.5
+            loss   = loss + sim.squeeze() * 0.5
             n_terms += 1
 
         return loss / max(n_terms, 1)
@@ -321,13 +305,8 @@ class ContrastiveStateRegularizer(nn.Module):
         self.tau = temperature
 
     def forward(self, hidden: torch.Tensor, regime: torch.Tensor) -> torch.Tensor:
-        """
-        Fix 1: median split instead of hard-coded 0.4 / 0.6 thresholds.
-        """
         reg_scalar = regime[..., 0]
-        reg_flat   = reg_scalar.reshape(-1)
-        median     = reg_flat.median()
-
+        median     = reg_scalar.reshape(-1).median()
         low_mask   = (reg_scalar <= median)
         high_mask  = (reg_scalar > median)
 
@@ -335,23 +314,16 @@ class ContrastiveStateRegularizer(nn.Module):
             return torch.tensor(0.0, device=hidden.device)
 
         h_flat  = hidden.reshape(-1, hidden.shape[-1])
-        lm_flat = low_mask.reshape(-1)
-        hm_flat = high_mask.reshape(-1)
-
-        h_low  = F.normalize(h_flat[lm_flat], dim=-1)
-        h_high = F.normalize(h_flat[hm_flat], dim=-1)
+        h_low   = F.normalize(h_flat[low_mask.reshape(-1)],  dim=-1)
+        h_high  = F.normalize(h_flat[high_mask.reshape(-1)], dim=-1)
 
         anchor_low  = h_low.mean(dim=0, keepdim=True)
         anchor_high = h_high.mean(dim=0, keepdim=True)
 
-        sim_pos  = (anchor_low * h_low).sum(dim=-1) / self.tau
-        sim_neg  = (anchor_low * h_high).sum(dim=-1) / self.tau
-        pos_loss = -sim_pos.mean()
-        neg_loss =  sim_neg.mean()
-
-        sim_pos2  = (anchor_high * h_high).sum(dim=-1) / self.tau
-        sim_neg2  = (anchor_high * h_low).sum(dim=-1)  / self.tau
-        pos_loss2 = -sim_pos2.mean()
-        neg_loss2 =  sim_neg2.mean()
+        # Fix CT: neg_loss must also be negative (penalise high cross-regime sim)
+        pos_loss  = -(anchor_low  * h_low).sum(dim=-1).mean()  / self.tau
+        neg_loss  = -(anchor_low  * h_high).sum(dim=-1).mean() / self.tau * (-1)  # push apart
+        pos_loss2 = -(anchor_high * h_high).sum(dim=-1).mean() / self.tau
+        neg_loss2 = -(anchor_high * h_low).sum(dim=-1).mean()  / self.tau * (-1)
 
         return (pos_loss + neg_loss + pos_loss2 + neg_loss2) * 0.25

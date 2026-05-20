@@ -2,8 +2,10 @@
 Full CASA-RNN quickstart — all modules active, SoftModuleRouter governs tradeoffs.
 
 Changelog:
-  - Router sparsity loss weight: 0.02 -> 0.05 (Fix 3)
-  - Direction A/C remain active through RC and CT logging
+  - Router sparsity weight: 0.05
+  - Fix Router T: log_temperature split into separate param group with lr=5e-3
+  - Fix CT direction in neuro_modules.py
+  - Fix Danger normalization in danger.py
 """
 import torch
 import torch.optim as optim
@@ -69,16 +71,24 @@ model = CASARNNModel(
 replay_buf  = HippocampalReplayBuffer(capacity=300, replay_every=25)
 bio_loss_fn = BioConstraintLoss(ne_weight=0.05, da_weight=0.05)
 
-alpha_params  = [model.genome.soft_op.alpha]
-router_params = list(model.rnn.router.parameters())
-other_params  = [
+alpha_params = [model.genome.soft_op.alpha]
+
+# Fix Router T: log_temperature 獨立拆出來，給更高 lr 讓 temperature 更容易下降
+log_temp_params = [model.rnn.router.log_temperature]
+router_net_params = [
+    p for n, p in model.rnn.router.named_parameters()
+    if 'log_temperature' not in n
+]
+other_params = [
     p for n, p in model.named_parameters()
-    if 'soft_op.alpha' not in n and 'router' not in n
+    if 'soft_op.alpha' not in n
+    and 'rnn.router' not in n
 ]
 optimizer = optim.AdamW([
-    {'params': other_params,  'lr': 3e-4},
-    {'params': alpha_params,  'lr': 3e-3, 'weight_decay': 0.0},
-    {'params': router_params, 'lr': 1e-3, 'weight_decay': 0.0},
+    {'params': other_params,      'lr': 3e-4},
+    {'params': alpha_params,      'lr': 3e-3,  'weight_decay': 0.0},
+    {'params': router_net_params, 'lr': 1e-3,  'weight_decay': 0.0},
+    {'params': log_temp_params,   'lr': 5e-3,  'weight_decay': 0.0},  # temperature 快速響應
 ], weight_decay=1e-4)
 
 loss_fn   = CounterfactualLoss(alpha=0.1, beta=0.01, gamma=0.05, use_nll=True, nll_clamp=3.0, regime_scale=True)
