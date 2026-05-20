@@ -13,8 +13,8 @@ Modules:
 9. SoftModuleRouter  — learned mixture of all optional modules
 
 Changelog:
-  - SoftModuleRouter: added regime_consistency_loss() (Direction A)
-  - ContrastiveStateRegularizer: new class (Direction C)
+  - SoftModuleRouter: regime_consistency_loss() now uses median split (Fix 1)
+  - ContrastiveStateRegularizer: now uses median split (Fix 1)
 """
 
 import torch
@@ -24,10 +24,6 @@ from collections import deque
 from typing import Optional, Tuple
 import random
 
-
-# ---------------------------------------------------------------------------
-# 1. NeuromodulatorGating
-# ---------------------------------------------------------------------------
 
 class NeuromodulatorGating(nn.Module):
     def __init__(self, hidden_size: int, context_size: int = 3):
@@ -71,10 +67,6 @@ class NeuromodulatorGating(nn.Module):
         }
 
 
-# ---------------------------------------------------------------------------
-# 2. ThalamicAttention
-# ---------------------------------------------------------------------------
-
 class ThalamicAttention(nn.Module):
     def __init__(self, hidden_size: int, context_size: int = 3):
         super().__init__()
@@ -89,10 +81,6 @@ class ThalamicAttention(nn.Module):
         gate = self.trn(context)
         return self.norm(h + gate * torch.tanh(self.relay(h)))
 
-
-# ---------------------------------------------------------------------------
-# 3. HippocampalReplayBuffer
-# ---------------------------------------------------------------------------
 
 class HippocampalReplayBuffer:
     def __init__(self, capacity: int = 500, replay_every: int = 20):
@@ -122,10 +110,6 @@ class HippocampalReplayBuffer:
         return len(self.buffer)
 
 
-# ---------------------------------------------------------------------------
-# 4. PrefrontalWorkingMemory
-# ---------------------------------------------------------------------------
-
 class PrefrontalWorkingMemory(nn.Module):
     def __init__(self, hidden_size: int, context_dim: int = 16):
         super().__init__()
@@ -148,10 +132,6 @@ class PrefrontalWorkingMemory(nn.Module):
         return self.norm(self.output_gate(h_new) * h_new)
 
 
-# ---------------------------------------------------------------------------
-# 5. MetaLearningStrategyBank
-# ---------------------------------------------------------------------------
-
 STRATEGY_NAMES = ["rehearsal", "chunking", "associative", "contrastive", "slow"]
 
 
@@ -173,12 +153,7 @@ class MetaLearningStrategyBank(nn.Module):
         self.slow        = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.Tanh())
         self.norm        = nn.LayerNorm(hidden_size)
 
-    def forward(
-        self,
-        h: torch.Tensor,
-        context: torch.Tensor,
-        rpe: torch.Tensor,
-    ) -> Tuple[torch.Tensor, dict]:
+    def forward(self, h: torch.Tensor, context: torch.Tensor, rpe: torch.Tensor) -> Tuple[torch.Tensor, dict]:
         sel_in = torch.cat([h, context, rpe], dim=-1)
         logits = self.selector(sel_in)
         w      = torch.softmax(logits, dim=-1)
@@ -201,10 +176,6 @@ class MetaLearningStrategyBank(nn.Module):
         w_mean = w.mean(dim=(0, 1)).clamp(min=1e-8)
         return -(w_mean * w_mean.log()).sum()
 
-
-# ---------------------------------------------------------------------------
-# 6. RegimeTransitionDetector
-# ---------------------------------------------------------------------------
 
 class RegimeTransitionDetector(nn.Module):
     def __init__(self, hidden_size: int, window: int = 8):
@@ -232,10 +203,6 @@ class RegimeTransitionDetector(nn.Module):
         return F.binary_cross_entropy(trans_prob, target)
 
 
-# ---------------------------------------------------------------------------
-# 7. CerebellarForwardModel
-# ---------------------------------------------------------------------------
-
 class CerebellarForwardModel(nn.Module):
     def __init__(self, hidden_size: int, input_size: int, proj_size: int = 32):
         super().__init__()
@@ -257,10 +224,6 @@ class CerebellarForwardModel(nn.Module):
         return (h_pred - h_next.detach()).pow(2).mean(dim=-1, keepdim=True)
 
 
-# ---------------------------------------------------------------------------
-# 8. HomeostaticGainControl
-# ---------------------------------------------------------------------------
-
 class HomeostaticGainControl(nn.Module):
     def __init__(self, da_set: float = 0.55, ne_set: float = 0.35, sht_set: float = 0.50,
                  ema_alpha: float = 0.02, penalty_weight: float = 0.03):
@@ -280,38 +243,18 @@ class HomeostaticGainControl(nn.Module):
         self.ne_ema  = (1 - self.alpha) * self.ne_ema  + self.alpha * ne_mean
         self.sht_ema = (1 - self.alpha) * self.sht_ema + self.alpha * sht_mean
 
-    def homeostatic_loss(
-        self,
-        da:  torch.Tensor,
-        ne:  torch.Tensor,
-        sht: torch.Tensor,
-    ) -> torch.Tensor:
+    def homeostatic_loss(self, da: torch.Tensor, ne: torch.Tensor, sht: torch.Tensor) -> torch.Tensor:
         l_da  = (da.mean()  - self.da_set).pow(2)
         l_ne  = (ne.mean()  - self.ne_set).pow(2)
         l_sht = (sht.mean() - self.sht_set).pow(2)
         return self.weight * (l_da + l_ne + l_sht)
 
 
-# ---------------------------------------------------------------------------
-# 9. SoftModuleRouter
-# ---------------------------------------------------------------------------
-
 MODULE_NAMES = ["thalamic", "neuromod", "pfc_wm", "strategy", "transition", "cerebellum", "astrocyte", "danger", "tda", "cpg"]
 
 
 class SoftModuleRouter(nn.Module):
-    """
-    Learned soft gating over all optional bio/topology modules.
-
-    Changelog:
-      - regime_consistency_loss(): Direction A — same regime -> same routing.
-        Penalises timesteps in the same regime whose router weights diverge,
-        and rewards divergence between different regimes.
-        This forces the router to specialise PER REGIME rather than averaging
-        across regimes, which is why temperature was previously stuck at ~1.9.
-    """
-    def __init__(self, hidden_size: int, num_modules: int = len(MODULE_NAMES),
-                 init_temperature: float = 2.0):
+    def __init__(self, hidden_size: int, num_modules: int = len(MODULE_NAMES), init_temperature: float = 2.0):
         super().__init__()
         self.num_modules = num_modules
         self.log_temperature = nn.Parameter(torch.tensor(float(init_temperature)).log())
@@ -325,52 +268,30 @@ class SoftModuleRouter(nn.Module):
     def temperature(self) -> torch.Tensor:
         return self.log_temperature.exp().clamp(0.1, 5.0)
 
-    def forward(
-        self,
-        h: torch.Tensor,       # (B, H)
-        regime: torch.Tensor,  # (B, 1)
-        danger: torch.Tensor,  # (B, 1)
-        vov:    torch.Tensor,  # (B, 1)
-    ) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, regime: torch.Tensor, danger: torch.Tensor, vov: torch.Tensor) -> torch.Tensor:
         ctx    = torch.cat([h, regime, danger, vov], dim=-1)
         logits = self.router(ctx)
         return torch.softmax(logits / self.temperature, dim=-1)
 
     def entropy_loss(self, weights: torch.Tensor) -> torch.Tensor:
-        """Encourage diverse module usage during warmup."""
         w = weights.mean(dim=list(range(weights.dim() - 1))).clamp(min=1e-8)
         return -(w * w.log()).sum()
 
     def sparsity_loss(self, weights: torch.Tensor) -> torch.Tensor:
-        """After warmup: encourage sparse / specialised routing."""
         w = weights.mean(dim=list(range(weights.dim() - 1))).clamp(min=1e-8)
         return (w * w.log()).sum()
 
-    def regime_consistency_loss(
-        self,
-        weights: torch.Tensor,   # (B, T, num_modules)
-        regime:  torch.Tensor,   # (B, T, 1) or (B, T, 2) regime probs
-    ) -> torch.Tensor:
+    def regime_consistency_loss(self, weights: torch.Tensor, regime: torch.Tensor) -> torch.Tensor:
         """
-        Direction A: Regime-Consistent Router.
-
-        For each pair of timesteps within the same batch:
-          - same regime (regime diff < 0.2)  -> router weights should be similar
-            (minimise cosine distance within regime)
-          - different regime (diff > 0.5)    -> router weights should differ
-            (maximise cosine distance across regimes)
-
-        Uses a lightweight mean-per-regime approximation to avoid O(T^2) pairs:
-          1. Segment sequence into low/high regime bins
-          2. Compute mean router weight per bin
-          3. Penalise intra-bin variance, reward inter-bin distance
+        Fix 1: median split instead of hard-coded 0.4 / 0.6 thresholds.
+        This keeps RC active even when regime stays in a narrow band like 0.48~0.60.
         """
-        # Use first channel of regime as regime scalar
-        reg_scalar = regime[..., 0]  # (B, T)
+        reg_scalar = regime[..., 0]
+        reg_flat   = reg_scalar.reshape(-1)
+        median     = reg_flat.median()
 
-        # Split into two regime bins: low (< 0.4) and high (> 0.6)
-        low_mask  = (reg_scalar < 0.4)   # (B, T)
-        high_mask = (reg_scalar > 0.6)   # (B, T)
+        low_mask   = (reg_scalar <= median)
+        high_mask  = (reg_scalar > median)
 
         loss = torch.tensor(0.0, device=weights.device)
         n_terms = 0
@@ -378,84 +299,58 @@ class SoftModuleRouter(nn.Module):
         for mask in [low_mask, high_mask]:
             if mask.sum() < 2:
                 continue
-            # mean router weight within this regime bin
-            w_in = weights[mask]          # (N, num_modules)
-            w_mean = w_in.mean(dim=0)     # (num_modules,)
-            # intra-regime variance: penalise spread
+            w_in = weights[mask]
+            w_mean = w_in.mean(dim=0)
             intra_var = ((w_in - w_mean.unsqueeze(0)).pow(2)).mean()
             loss = loss + intra_var
             n_terms += 1
 
-        # inter-regime: reward distance between low and high regime routing
         if low_mask.sum() > 0 and high_mask.sum() > 0:
             w_low  = weights[low_mask].mean(dim=0)
             w_high = weights[high_mask].mean(dim=0)
             sim    = F.cosine_similarity(w_low.unsqueeze(0), w_high.unsqueeze(0))
-            # we want low similarity between regimes -> penalise high sim
             loss = loss + sim.squeeze() * 0.5
             n_terms += 1
 
         return loss / max(n_terms, 1)
 
 
-# ---------------------------------------------------------------------------
-# 10. ContrastiveStateRegularizer  (Direction C)
-# ---------------------------------------------------------------------------
-
 class ContrastiveStateRegularizer(nn.Module):
-    """
-    Direction C: Contrastive State Regularizer.
-
-    Encourages hidden states to form regime-aware clusters:
-      - Positive pairs:  same regime bin -> small cosine distance
-      - Negative pairs:  different regime -> large cosine distance
-
-    Uses NT-Xent (normalised temperature-scaled cross entropy) style loss
-    on mean regime embeddings, which is O(B) not O(B^2).
-
-    This is an AUXILIARY loss added on top of the task loss.
-    Weight recommended: 0.01~0.05 (start small, real data may need tuning).
-    """
     def __init__(self, temperature: float = 0.5):
         super().__init__()
         self.tau = temperature
 
-    def forward(
-        self,
-        hidden: torch.Tensor,   # (B, T, H) fused hidden states
-        regime: torch.Tensor,   # (B, T, 1) or (B, T, 2)
-    ) -> torch.Tensor:
-        reg_scalar = regime[..., 0]  # (B, T)
-        low_mask   = (reg_scalar < 0.4)
-        high_mask  = (reg_scalar > 0.6)
+    def forward(self, hidden: torch.Tensor, regime: torch.Tensor) -> torch.Tensor:
+        """
+        Fix 1: median split instead of hard-coded 0.4 / 0.6 thresholds.
+        """
+        reg_scalar = regime[..., 0]
+        reg_flat   = reg_scalar.reshape(-1)
+        median     = reg_flat.median()
+
+        low_mask   = (reg_scalar <= median)
+        high_mask  = (reg_scalar > median)
 
         if low_mask.sum() < 2 or high_mask.sum() < 2:
             return torch.tensor(0.0, device=hidden.device)
 
-        # Flatten (B, T, H) -> (B*T, H) then mask
         h_flat  = hidden.reshape(-1, hidden.shape[-1])
         lm_flat = low_mask.reshape(-1)
         hm_flat = high_mask.reshape(-1)
 
-        h_low  = F.normalize(h_flat[lm_flat], dim=-1)   # (N_low, H)
-        h_high = F.normalize(h_flat[hm_flat], dim=-1)   # (N_high, H)
+        h_low  = F.normalize(h_flat[lm_flat], dim=-1)
+        h_high = F.normalize(h_flat[hm_flat], dim=-1)
 
-        # Use mean embeddings as anchors (avoids O(N^2) all-pairs)
-        anchor_low  = h_low.mean(dim=0, keepdim=True)   # (1, H)
-        anchor_high = h_high.mean(dim=0, keepdim=True)  # (1, H)
+        anchor_low  = h_low.mean(dim=0, keepdim=True)
+        anchor_high = h_high.mean(dim=0, keepdim=True)
 
-        # Positive sim: anchor_low with low samples
-        sim_pos = (anchor_low * h_low).sum(dim=-1) / self.tau   # (N_low,)
-        # Negative sim: anchor_low with high samples
-        sim_neg = (anchor_low * h_high).sum(dim=-1) / self.tau  # (N_high,)
-
-        # NT-Xent style: for each positive, contrast against all negatives
+        sim_pos  = (anchor_low * h_low).sum(dim=-1) / self.tau
+        sim_neg  = (anchor_low * h_high).sum(dim=-1) / self.tau
         pos_loss = -sim_pos.mean()
         neg_loss =  sim_neg.mean()
 
-        # Symmetric: also do anchor_high vs its positives/negatives
-        sim_pos2 = (anchor_high * h_high).sum(dim=-1) / self.tau
-        sim_neg2 = (anchor_high * h_low).sum(dim=-1)  / self.tau
+        sim_pos2  = (anchor_high * h_high).sum(dim=-1) / self.tau
+        sim_neg2  = (anchor_high * h_low).sum(dim=-1)  / self.tau
         pos_loss2 = -sim_pos2.mean()
         neg_loss2 =  sim_neg2.mean()
 

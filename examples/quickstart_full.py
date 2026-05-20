@@ -2,11 +2,8 @@
 Full CASA-RNN quickstart — all modules active, SoftModuleRouter governs tradeoffs.
 
 Changelog:
-  - Router sparsity loss weight: 0.005 -> 0.02
-  - Danger EMA alpha: 0.01 -> 0.05
-  - Direction A: regime_consistency_loss added to training loop
-  - Direction B: selective_reset integrated in multiscale.py (no change needed here)
-  - Direction C: contrastive_loss added to training loop
+  - Router sparsity loss weight: 0.02 -> 0.05 (Fix 3)
+  - Direction A/C remain active through RC and CT logging
 """
 import torch
 import torch.optim as optim
@@ -129,19 +126,16 @@ for step in range(TOTAL):
                 da=nt["dopamine"], ne=nt["norepinephrine"], sht=sht
             )
 
-    # Router: entropy warmup -> sparsity + regime consistency (Direction A)
     rw_full = extra.get("router_weights", None)
     if rw_full is not None:
         if step < WARMUP:
             loss = loss - rew * model.rnn.router.entropy_loss(rw_full)
         else:
-            loss = loss + 0.02 * model.rnn.router.sparsity_loss(rw_full)
-            # Direction A: regime consistency loss (active after warmup)
+            loss = loss + 0.05 * model.rnn.router.sparsity_loss(rw_full)
             rc_loss = extra.get("regime_consistency_loss", None)
             if rc_loss is not None:
                 loss = loss + 0.01 * rc_loss
 
-    # Direction C: contrastive state regularizer
     ct_loss = extra.get("contrastive_loss", None)
     if ct_loss is not None:
         loss = loss + 0.02 * ct_loss

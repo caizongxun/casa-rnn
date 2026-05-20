@@ -3,6 +3,7 @@ Danger Signal Detector — immune-system inspired anomaly gate.
 
 Changelog:
   - ema_alpha: 0.01 -> 0.05  (faster EMA, tracks regime shifts quickly)
+  - init variance: ones -> 0.1  (Fix 2: stabilise early Mahalanobis distance)
   - selective_reset(): new method, soft-resets h_slow when danger is high
     (Direction B: Selective State Reset)
 """
@@ -15,10 +16,9 @@ class DangerSignalDetector(nn.Module):
         super().__init__()
         self.alpha      = ema_alpha
         self.log_thresh = nn.Parameter(torch.tensor(1.0))
-        # learnable reset gate: decides how much of h_slow to wipe
-        self.reset_proj = nn.Linear(1, 1, bias=True)  # danger_score -> reset magnitude
+        self.reset_proj = nn.Linear(1, 1, bias=True)
         self.register_buffer("mu",  torch.zeros(hidden_size))
-        self.register_buffer("var", torch.ones(hidden_size))
+        self.register_buffer("var", torch.full((hidden_size,), 0.1))
         self.register_buffer("n",   torch.tensor(0.0))
 
     @property
@@ -50,23 +50,7 @@ class DangerSignalDetector(nn.Module):
         boost = (danger_score / (self.threshold + 1e-6)).clamp(0, 1)
         return (ne_raw + 0.3 * boost).clamp(0, 1)
 
-    def selective_reset(
-        self,
-        h_slow: torch.Tensor,   # (B, hidden_size) — long-term hidden state
-        danger_score: torch.Tensor,  # (B, 1)
-    ) -> torch.Tensor:
-        """
-        Direction B: Selective State Reset.
-
-        When danger is high (regime change detected), soft-erase h_slow
-        so stale market memory does not pollute new regime predictions.
-        h_fast is intentionally left intact (short-term dynamics still useful).
-
-        reset_gate in [0, 1]:
-          0 = no reset (normal market)
-          1 = full reset (extreme regime change)
-        """
-        # sigmoid maps danger -> reset_gate magnitude; bias initialised negative
-        # so gate starts near zero and only opens under genuine danger
-        reset_gate = torch.sigmoid(self.reset_proj(danger_score))  # (B, 1)
+    def selective_reset(self, h_slow: torch.Tensor, danger_score: torch.Tensor) -> torch.Tensor:
+        """Soft-erase h_slow under danger so stale regime memory does not leak forward."""
+        reset_gate = torch.sigmoid(self.reset_proj(danger_score))
         return (1.0 - reset_gate) * h_slow
