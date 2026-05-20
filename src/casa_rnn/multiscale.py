@@ -1,17 +1,18 @@
 """
-Multi-Scale CASA-RNN — full bio + topology + pattern pipeline.
+Multi-Scale CASA-RNN -- full bio + topology + pattern pipeline.
 
 Changelog:
-  v0.4 - DangerSignalDetector.selective_reset(), regime_consistency_loss,
-         ContrastiveStateRegularizer
-  v0.5 - PatternExtractor (CNN), LatentExpertBank, curriculum_weight
-  v0.6.1 - Sequence-level context z-score normalisation:
-           collect regime/log_vol/vov across the full sequence BEFORE the
-           time loop, compute per-feature mean/std, then pass normalised
-           ctx to neuro_gate at each step.  This makes DA/NE respond to
-           within-sequence deviation rather than absolute values, fixing
-           the DA=0.55 stuck problem caused by per-step batch z-score
-           where all samples share the same value at each timestep.
+  v0.4  - DangerSignalDetector, regime_consistency_loss, ContrastiveStateRegularizer
+  v0.5  - PatternExtractor (CNN), LatentExpertBank, curriculum_weight
+  v0.6  - DirectionLoss + BioConstraintLoss wired in loss.py
+  v0.6.1 - seq-level ctx z-score (pre-pass approach, later found broken)
+  v0.6.2 - cell.py: dedicated scalar regime_head
+  v0.6.3 - Remove broken pre-pass entirely.
+           Wire regime_scalar (from regime_head) directly into:
+             - ctx fed to neuro_gate each step
+             - all_regime collection (so extra[regime_probs] has real variance)
+           ctx is now [regime_scalar_mean, log_vol_mean, vov_mean] from
+           current step live values -- no pre-pass, no stale hidden states.
 """
 import torch
 import torch.nn as nn
@@ -61,10 +62,9 @@ class MultiScaleCASARNN(nn.Module):
 
         self.pattern_extractor = PatternExtractor(input_size, mid_channels=cnn_mid_channels)
 
-        from .cpg import CPGEncoder
-        self.cpg         = CPGEncoder(cpg_periods)
-        cpg_dim          = self.cpg.out_dim
-        rnn_input_size   = input_size + cpg_dim
+        self.cpg       = CPGEncoder(cpg_periods)
+        cpg_dim        = self.cpg.out_dim
+        rnn_input_size = input_size + cpg_dim
 
         self.cell_fast = CASARNNCell(rnn_input_size, hidden_size, dropout=dropout)
         self.cell_mid  = CASARNNCell(rnn_input_size, hidden_size, dropout=dropout)
@@ -107,19 +107,6 @@ class MultiScaleCASARNN(nn.Module):
         decay = min(delta, 1.0) * self.hidden_decay_rate
         return h * (1.0 - decay)
 
-    @staticmethod
-    def _seq_zscore(tensor: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        """
-        Normalise a (T, B, C) or (B, T, C) tensor along the T dimension
-        so each feature has zero mean and unit variance across the sequence.
-        Used to give neuro_gate relative context rather than absolute values.
-        Called once before the time loop with pre-computed full-seq tensors.
-        """
-        # tensor shape: (T, C) after stacking across time steps
-        mu  = tensor.mean(dim=0, keepdim=True)
-        std = tensor.std(dim=0, keepdim=True).clamp(min=eps)
-        return (tensor - mu) / std
-
     def forward(
         self,
         x: torch.Tensor,
@@ -129,7 +116,7 @@ class MultiScaleCASARNN(nn.Module):
         t_offset: int = 0,
         router_entropy_weight: float = 0.02,
     ):
-        batch, seq_len, raw_feat = x.shape
+        batch, seq_len, _ = x.shape
         device = x.device
         hidden = init_hidden if init_hidden is not None else self._init_hidden(batch, device)
 
@@ -147,43 +134,6 @@ class MultiScaleCASARNN(nn.Module):
             self.astrocyte.reset(batch, device)
             expert_states = self.latent_experts.reset(batch, device)
 
-        # -------------------------------------------------------------------
-        # v0.6.1: pre-compute sequence-level normalised context
-        # We need regime/log_vol/vov for the full sequence to z-score them.
-        # Do a lightweight pass to collect these scalars, then normalise.
-        # -------------------------------------------------------------------
-        seq_ctx_raw = None
-        if self.use_bio and vol_indicator is not None:
-            regime_list, logvol_list, vov_list = [], [], []
-            prev_lv = None
-            # temporary cell states just for context pre-computation
-            _h = self._init_hidden(batch, device)
-            for t in range(seq_len):
-                xt_a = x_aug[:, t, :]
-                vt   = vol_indicator[:, t, :]
-                _, hf_f, reg_f, _ = self.cell_fast(xt_a, *_h['fast'], vt)
-                _, hf_m, reg_m, _ = self.cell_mid (xt_a, *_h['mid'],  vt)
-                _, hf_s, reg_s, _ = self.cell_slow(xt_a, *_h['slow'], vt)
-                _h['fast'] = (torch.zeros_like(hf_f), hf_f)
-                _h['mid']  = (torch.zeros_like(hf_m), hf_m)
-                _h['slow'] = (torch.zeros_like(hf_s), hf_s)
-                reg_mean = (reg_f + reg_m + reg_s) / 3.0
-                lv = torch.log1p(vt.abs())
-                vov = (lv - prev_lv).abs() if prev_lv is not None else torch.zeros_like(lv)
-                prev_lv = lv.detach()
-                regime_list.append(reg_mean.mean(dim=-1, keepdim=True))  # (B,1)
-                logvol_list.append(lv.mean(dim=-1, keepdim=True))
-                vov_list.append(vov.mean(dim=-1, keepdim=True))
-            # stack: (T, B, 1) -> mean over batch -> (T, 1) for z-score
-            seq_regime = torch.stack(regime_list, dim=0).mean(dim=1)  # (T, 1)
-            seq_logvol = torch.stack(logvol_list, dim=0).mean(dim=1)
-            seq_vov    = torch.stack(vov_list,    dim=0).mean(dim=1)
-            seq_ctx_raw = torch.cat([seq_regime, seq_logvol, seq_vov], dim=-1)  # (T, 3)
-            seq_ctx_norm = self._seq_zscore(seq_ctx_raw)  # (T, 3) normalised
-        else:
-            seq_ctx_norm = None
-        # -------------------------------------------------------------------
-
         means, stds = [], []
         all_regime, all_scale_weights = [], []
         all_neuro_scalar = {k: [] for k in ["dopamine","acetylcholine","norepinephrine","serotonin"]}
@@ -194,7 +144,7 @@ class MultiScaleCASARNN(nn.Module):
         all_router_w    = []
         all_danger      = []
         all_fused       = []
-        all_regime_t    = []
+        all_regime_t    = []   # stores (B,1,1) regime_scalar per step
         all_latent_w    = []
         total_pred_err  = torch.zeros(1, device=device)
         max_danger      = torch.zeros(1, device=device)
@@ -210,19 +160,23 @@ class MultiScaleCASARNN(nn.Module):
             xt_aug = x_aug[:, t, :]
             vt     = vol_indicator[:, t, :] if vol_indicator is not None else None
 
-            hs_f, hf_f, reg_f, pe_f = self.cell_fast(xt_aug, *hidden['fast'], vt)
+            # --- three-scale RNN cells ---
+            # cell returns: h_slow_new, h_fast_new, regime_scalar (B,), pred_error
+            hs_f, hf_f, reg_scalar_f, pe_f = self.cell_fast(xt_aug, *hidden['fast'], vt)
             slow_step_counter += 1
             if slow_step_counter >= slow_update_every:
-                hs_m, hf_m, reg_m, pe_m = self.cell_mid (xt_aug, *hidden['mid'],  vt)
-                hs_s, hf_s, reg_s, pe_s = self.cell_slow(xt_aug, *hidden['slow'], vt)
+                hs_m, hf_m, reg_scalar_m, pe_m = self.cell_mid (xt_aug, *hidden['mid'],  vt)
+                hs_s, hf_s, reg_scalar_s, pe_s = self.cell_slow(xt_aug, *hidden['slow'], vt)
                 slow_step_counter = 0
             else:
-                hs_m, hf_m = hidden['mid'];  reg_m = (hidden['mid'][1] * 0).mean(-1) + 0.5; pe_m = torch.zeros_like(pe_f)
-                hs_s, hf_s = hidden['slow']; reg_s = reg_m; pe_s = pe_m
+                hs_m, hf_m = hidden['mid'];  reg_scalar_m = torch.full((batch,), 0.5, device=device); pe_m = torch.zeros_like(pe_f)
+                hs_s, hf_s = hidden['slow']; reg_scalar_s = reg_scalar_m.clone();                      pe_s = pe_m.clone()
 
-            regime_mean = (reg_f + reg_m + reg_s) / 3.0
-            r_now  = regime_mean.mean().detach()
-            delta  = (r_now - self.regime_ema).abs().item()
+            # v0.6.3: regime_scalar from regime_head -- real dynamic range
+            regime_scalar_mean = (reg_scalar_f + reg_scalar_m + reg_scalar_s) / 3.0  # (B,)
+
+            r_now = regime_scalar_mean.mean().detach()
+            delta = (r_now - self.regime_ema).abs().item()
             self.regime_ema = 0.9 * self.regime_ema + 0.1 * r_now
 
             if delta > self.regime_reset_threshold:
@@ -243,9 +197,8 @@ class MultiScaleCASARNN(nn.Module):
             danger_score = torch.zeros(batch, 1, device=device)
 
             if self.use_bio:
-                regime_t = regime_mean.unsqueeze(-1)
-                vol_t    = vt if vt is not None else torch.zeros_like(regime_t)
-                log_vol  = torch.log1p(vol_t.abs())
+                vol_t   = vt if vt is not None else torch.zeros(batch, 1, device=device)
+                log_vol = torch.log1p(vol_t.abs())                # (B, 1)
                 if prev_log_vol is None:
                     vov = torch.zeros_like(log_vol)
                 else:
@@ -261,24 +214,23 @@ class MultiScaleCASARNN(nn.Module):
                     hf_s_reset = self.danger_det.selective_reset(hidden['slow'][1], danger_score)
                     hidden['slow'] = (hs_s_reset, hf_s_reset)
 
-                mean_danger = danger_score.mean().item()
+                mean_danger   = danger_score.mean().item()
                 slow_update_every = max(1, int(3.0 / (1.0 + 3.0 * mean_danger)))
 
                 fused = fused + 0.1 * tda_h_base
 
                 router_weights = self.router(
-                    h=fused, regime=regime_t, danger=danger_score, vov=vov,
+                    h=fused, regime=regime_scalar_mean.unsqueeze(-1), danger=danger_score, vov=vov,
                 )
                 all_router_w.append(router_weights)
-
                 w = router_weights
 
-                # v0.6.1: use sequence-level normalised ctx if available
-                if seq_ctx_norm is not None:
-                    ctx_vec = seq_ctx_norm[t].unsqueeze(0).expand(batch, -1)  # (B, 3)
-                    ctx     = ctx_vec.unsqueeze(1)                             # (B, 1, 3)
-                else:
-                    ctx = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)
+                # v0.6.3: ctx from live regime_scalar + log_vol + vov
+                # regime_scalar_mean: (B,) -> unsqueeze to (B,1)
+                regime_ctx = regime_scalar_mean.unsqueeze(-1)          # (B, 1)
+                log_vol_ctx = log_vol.mean(dim=-1, keepdim=True)       # (B, 1)
+                vov_ctx     = vov.mean(dim=-1, keepdim=True)           # (B, 1)
+                ctx = torch.cat([regime_ctx, log_vol_ctx, vov_ctx], dim=-1).unsqueeze(1)  # (B, 1, 3)
 
                 h_t   = fused.unsqueeze(1)
                 rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)
@@ -342,7 +294,10 @@ class MultiScaleCASARNN(nn.Module):
                 fused = h_t.squeeze(1)
 
                 all_fused.append(fused.unsqueeze(1))
-                all_regime_t.append(regime_t.unsqueeze(1))
+
+                # v0.6.3: store regime_scalar per step as (B,1,1) for consistency
+                regime_t_store = regime_scalar_mean.unsqueeze(-1).unsqueeze(-1)  # (B,1,1)
+                all_regime_t.append(regime_t_store)
 
                 for k in all_neuro_scalar:
                     all_neuro_scalar[k].append(neuro_d[k].mean().item())
@@ -355,20 +310,23 @@ class MultiScaleCASARNN(nn.Module):
                 all_danger.append(danger_score)
 
             if self.use_memory:
-                self.memory.write(fused, regime_mean)
-                fused = self.memory.read(fused, regime_mean)
+                self.memory.write(fused, regime_scalar_mean)
+                fused = self.memory.read(fused, regime_scalar_mean)
 
-            mean, std = self.head(fused)
-            means.append(mean.unsqueeze(1))
-            stds.append(std.unsqueeze(1))
+            mean_out, std_out = self.head(fused)
+            means.append(mean_out.unsqueeze(1))
+            stds.append(std_out.unsqueeze(1))
 
-            regime_stack = torch.stack([reg_f, reg_m, reg_s], dim=1)
-            all_regime.append(regime_stack.unsqueeze(1))
+            # all_regime: store [reg_scalar_f, reg_scalar_m, reg_scalar_s] per step
+            regime_stack = torch.stack(
+                [reg_scalar_f, reg_scalar_m, reg_scalar_s], dim=1
+            ).unsqueeze(1)   # (B, 1, 3)
+            all_regime.append(regime_stack)
             all_scale_weights.append(weights.unsqueeze(1))
 
         means   = torch.cat(means, dim=1)
         stds    = torch.cat(stds, dim=1)
-        regime  = torch.cat(all_regime, dim=1)
+        regime  = torch.cat(all_regime, dim=1)   # (B, T, 3) -- real regime_scalar values
         scale_w = torch.cat(all_scale_weights, dim=1)
 
         neuro_summary = {k: (sum(v) / len(v) if v else 0.0) for k, v in all_neuro_scalar.items()}
@@ -382,7 +340,7 @@ class MultiScaleCASARNN(nn.Module):
 
         regime_consist_loss = torch.tensor(0.0, device=device)
         if self.use_bio and router_w_full is not None and all_regime_t:
-            regime_cat = torch.cat(all_regime_t, dim=1)
+            regime_cat = torch.cat(all_regime_t, dim=1)   # (B, T, 1)
             regime_consist_loss = self.router.regime_consistency_loss(router_w_full, regime_cat)
 
         contrastive_loss = torch.tensor(0.0, device=device)
