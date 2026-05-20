@@ -18,6 +18,11 @@ Binance Data Vision CSV columns (fixed order):
   0  open_time, 1 open, 2 high, 3 low, 4 close, 5 volume,
   6  close_time, 7 quote_volume, 8 count,
   9  taker_buy_volume, 10 taker_buy_quote_volume, 11 ignore
+
+Timestamp note:
+  Binance Data Vision files before 2025 use millisecond timestamps (13 digits).
+  Files from 2025 onwards use second timestamps (10 digits).
+  _read_bdv_csv auto-detects the unit based on the magnitude of the first value.
 """
 
 from __future__ import annotations
@@ -50,6 +55,10 @@ BINANCE_DV_COLS = [
 DEFAULT_CORR_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 DEFAULT_DATA_DIR     = Path("data")
 DEFAULT_START_YEAR   = 2020
+
+# Threshold: timestamps >= this are treated as milliseconds, otherwise seconds.
+# 1e12 ms = year ~2001, 1e10 s = year ~2286 (safe upper bound for seconds).
+_MS_THRESHOLD = 1_000_000_000_000   # 10^12
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +110,16 @@ class DataRegistry:
 # CSV loading
 # ---------------------------------------------------------------------------
 
+def _parse_timestamp_col(series: pd.Series) -> pd.Series:
+    """
+    Convert a numeric timestamp series to UTC datetime.
+    Auto-detects milliseconds (13-digit) vs seconds (10-digit).
+    """
+    first_valid = series.dropna().iloc[0] if not series.dropna().empty else 0
+    unit = "ms" if first_valid >= _MS_THRESHOLD else "s"
+    return pd.to_datetime(series, unit=unit, utc=True)
+
+
 def _read_bdv_csv(path: Path) -> pd.DataFrame:
     if path.suffix == ".zip":
         with zipfile.ZipFile(path) as zf:
@@ -127,7 +146,9 @@ def _read_bdv_csv(path: Path) -> pd.DataFrame:
 
     df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
     df = df.dropna(subset=["open_time"])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    # Auto-detect ms vs s
+    df["open_time"] = _parse_timestamp_col(df["open_time"])
+
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     for col in ["taker_buy_volume", "count", "quote_volume"]:
@@ -164,11 +185,6 @@ def _download_data_vision(
     registry: DataRegistry,
     start_year: int = DEFAULT_START_YEAR,
 ) -> Optional[pd.DataFrame]:
-    """
-    Download monthly ZIP files from Binance Data Vision for a symbol.
-    Saves each month as a separate ZIP in data_dir.
-    Returns concatenated DataFrame of all downloaded months.
-    """
     now = datetime.now(timezone.utc)
     months: List[Tuple[int, int]] = []
     for year in range(start_year, now.year + 1):
@@ -194,7 +210,6 @@ def _download_data_vision(
             urllib.request.urlretrieve(url, out_path)
             downloaded.append(out_path)
         except Exception:
-            # Month doesn't exist yet or network error - skip silently
             if out_path.exists():
                 out_path.unlink()
 
@@ -284,17 +299,10 @@ def _auto_download(
     registry: DataRegistry,
     ref_df: Optional[pd.DataFrame] = None,
 ) -> Optional[pd.DataFrame]:
-    """
-    Auto-download strategy:
-      1. Try Binance Data Vision (S3, no geo-block).
-      2. If that fails, fall back to REST API.
-    """
-    # --- Primary: Data Vision ---
     df = _download_data_vision(symbol, interval, data_dir, registry)
     if df is not None:
         return df
 
-    # --- Fallback: REST API ---
     print(f"  [market_data] Data Vision failed, trying REST API for {symbol} ...")
     if ref_df is not None:
         start_ms = int(ref_df["open_time"].min().timestamp() * 1000)
@@ -414,7 +422,6 @@ def load_and_enrich(
     if verbose:
         print(registry.summary())
 
-    # --- Primary symbol ---
     df = load_symbol(symbol, interval, registry)
     if df is None:
         if auto_download:
@@ -431,7 +438,6 @@ def load_and_enrich(
 
     df = enrich_features(df)
 
-    # --- Correlated symbols ---
     corr_dfs: Dict[str, pd.DataFrame] = {}
     for csym in corr_symbols:
         cdf = load_symbol(csym, interval, registry)
@@ -492,7 +498,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir",   default="data")
     args = parser.parse_args()
 
-    out_dir  = Path(args.data_dir)
+    out_dir = Path(args.data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     reg = DataRegistry(out_dir)
 
