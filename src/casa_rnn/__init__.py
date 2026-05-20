@@ -1,18 +1,17 @@
+"""CASA-RNN: Causal Adaptive State Autoregressive RNN."""
 from .cell import CASARNNCell
-from .model import CASARNNModel
 from .multiscale import MultiScaleCASARNN
 from .loss import CounterfactualLoss
-from .memory import MemoryBank
-from .regime import RegimeDetector
-from .heads import UncertaintyGatedHead
+from .genome import FeatureGenome, SoftOpBank, CrossFeatureInteraction, TemporalGenome
+from .model import CASARNNModel
 
-__version__ = "0.2.0"
 __all__ = [
     "CASARNNCell",
-    "CASARNNModel",
     "MultiScaleCASARNN",
     "CounterfactualLoss",
-    "MemoryBank",
-    "RegimeDetector",
-    "UncertaintyGatedHead",
+    "FeatureGenome",
+    "SoftOpBank",
+    "CrossFeatureInteraction",
+    "TemporalGenome",
+    "CASARNNModel",
 ]
