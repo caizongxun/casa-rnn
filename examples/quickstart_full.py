@@ -7,6 +7,10 @@ Routing entropy schedule:
 
 CPG period regulariser: keeps oscillators spread apart.
 Conformal calibration: after training, run on held-out slice for guaranteed intervals.
+
+Changelog:
+  - Router sparsity loss weight: 0.005 -> 0.02  (stronger specialisation pressure)
+  - Danger EMA alpha: 0.01 -> 0.05              (see danger.py)
 """
 import torch
 import torch.optim as optim
@@ -136,12 +140,13 @@ for step in range(TOTAL):
             )
 
     # SoftModuleRouter: entropy warmup -> sparsity
+    # sparsity weight increased 0.005 -> 0.02 for stronger specialisation
     rw_full = extra.get("router_weights", None)
     if rw_full is not None:
         if step < WARMUP:
             loss = loss - rew * model.rnn.router.entropy_loss(rw_full)
         else:
-            loss = loss + 0.005 * model.rnn.router.sparsity_loss(rw_full)
+            loss = loss + 0.02 * model.rnn.router.sparsity_loss(rw_full)
 
     # Conformal sharpness incentive
     loss = loss + 0.002 * model.conformal.sharpness_loss(stds)
@@ -191,7 +196,6 @@ for step in range(TOTAL):
         a_alp = extra.get("astrocyte_alpha", 0.0)
         r_tmp = extra.get("router_temperature", 0.0)
         rwm   = extra.get("router_w_mean", [])
-        # Top-2 active modules by router weight
         if rwm:
             top2 = sorted(enumerate(rwm), key=lambda kv: -kv[1])[:2]
             top2_str = "+".join(MODULE_NAMES[i] for i, _ in top2)

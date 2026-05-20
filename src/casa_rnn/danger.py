@@ -12,13 +12,16 @@ High danger_score -> model activates circuit-breaker behaviour:
   3. Signals adaptive stride to slow down (shorter windows, finer resolution)
 
 All thresholds are LEARNABLE so the model decides its own sensitivity.
+
+Changelog:
+  - ema_alpha: 0.01 -> 0.05  (faster EMA update, tracks regime shifts more closely)
 """
 import torch
 import torch.nn as nn
 
 
 class DangerSignalDetector(nn.Module):
-    def __init__(self, hidden_size: int, ema_alpha: float = 0.01):
+    def __init__(self, hidden_size: int, ema_alpha: float = 0.05):
         super().__init__()
         self.alpha     = ema_alpha
         # learnable threshold (sigmoid -> 0-1, scaled to reasonable Mahal range)
