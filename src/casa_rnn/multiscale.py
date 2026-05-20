@@ -2,16 +2,16 @@
 Multi-Scale CASA-RNN — full bio + topology + pattern pipeline.
 
 Changelog:
-  v0.4 - Integrated DangerSignalDetector.selective_reset() on h_slow
-       - SoftModuleRouter.regime_consistency_loss() added to extra dict
-       - ContrastiveStateRegularizer added
-  v0.5 - PatternExtractor (CNN) injected before RNN cells for local shape
-         recognition (analogous to visual chart reading)
-       - LatentExpertBank wired in after bio modules; expert hidden states
-         reset each forward pass
-       - curriculum_weight exposed in extra dict: training loop can scale
-         loss by difficulty (low value = easy sample, high = hard)
-       - z-score context normalisation active via updated NeuromodulatorGating
+  v0.4 - DangerSignalDetector.selective_reset(), regime_consistency_loss,
+         ContrastiveStateRegularizer
+  v0.5 - PatternExtractor (CNN), LatentExpertBank, curriculum_weight
+  v0.6.1 - Sequence-level context z-score normalisation:
+           collect regime/log_vol/vov across the full sequence BEFORE the
+           time loop, compute per-feature mean/std, then pass normalised
+           ctx to neuro_gate at each step.  This makes DA/NE respond to
+           within-sequence deviation rather than absolute values, fixing
+           the DA=0.55 stuck problem caused by per-step batch z-score
+           where all samples share the same value at each timestep.
 """
 import torch
 import torch.nn as nn
@@ -59,7 +59,6 @@ class MultiScaleCASARNN(nn.Module):
         self.hidden_decay_rate      = hidden_decay_rate
         self.input_size             = input_size
 
-        # v0.5: CNN pattern extractor runs on the full sequence before the RNN
         self.pattern_extractor = PatternExtractor(input_size, mid_channels=cnn_mid_channels)
 
         from .cpg import CPGEncoder
@@ -90,7 +89,6 @@ class MultiScaleCASARNN(nn.Module):
             self.tda_proj       = nn.Linear(3, hidden_size)
             self.router         = SoftModuleRouter(hidden_size, num_modules=len(MODULE_NAMES))
             self.contrastive_reg = ContrastiveStateRegularizer(temperature=0.5)
-            # v0.5: latent MoE experts
             self.latent_experts  = LatentExpertBank(hidden_size, num_experts=num_latent_experts)
 
         if use_memory:
@@ -109,6 +107,19 @@ class MultiScaleCASARNN(nn.Module):
         decay = min(delta, 1.0) * self.hidden_decay_rate
         return h * (1.0 - decay)
 
+    @staticmethod
+    def _seq_zscore(tensor: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """
+        Normalise a (T, B, C) or (B, T, C) tensor along the T dimension
+        so each feature has zero mean and unit variance across the sequence.
+        Used to give neuro_gate relative context rather than absolute values.
+        Called once before the time loop with pre-computed full-seq tensors.
+        """
+        # tensor shape: (T, C) after stacking across time steps
+        mu  = tensor.mean(dim=0, keepdim=True)
+        std = tensor.std(dim=0, keepdim=True).clamp(min=eps)
+        return (tensor - mu) / std
+
     def forward(
         self,
         x: torch.Tensor,
@@ -122,8 +133,8 @@ class MultiScaleCASARNN(nn.Module):
         device = x.device
         hidden = init_hidden if init_hidden is not None else self._init_hidden(batch, device)
 
-        # v0.5: apply CNN pattern extractor to full sequence before RNN
-        x = self.pattern_extractor(x)   # (B, T, F) -> (B, T, F) residual
+        # CNN pattern extractor
+        x = self.pattern_extractor(x)
 
         cpg_feats = self.cpg(seq_len, batch, device, t_offset=t_offset)
         x_aug     = torch.cat([x, cpg_feats], dim=-1)
@@ -134,8 +145,44 @@ class MultiScaleCASARNN(nn.Module):
 
         if self.use_bio:
             self.astrocyte.reset(batch, device)
-            # v0.5: initialise latent expert hidden states
             expert_states = self.latent_experts.reset(batch, device)
+
+        # -------------------------------------------------------------------
+        # v0.6.1: pre-compute sequence-level normalised context
+        # We need regime/log_vol/vov for the full sequence to z-score them.
+        # Do a lightweight pass to collect these scalars, then normalise.
+        # -------------------------------------------------------------------
+        seq_ctx_raw = None
+        if self.use_bio and vol_indicator is not None:
+            regime_list, logvol_list, vov_list = [], [], []
+            prev_lv = None
+            # temporary cell states just for context pre-computation
+            _h = self._init_hidden(batch, device)
+            for t in range(seq_len):
+                xt_a = x_aug[:, t, :]
+                vt   = vol_indicator[:, t, :]
+                _, hf_f, reg_f, _ = self.cell_fast(xt_a, *_h['fast'], vt)
+                _, hf_m, reg_m, _ = self.cell_mid (xt_a, *_h['mid'],  vt)
+                _, hf_s, reg_s, _ = self.cell_slow(xt_a, *_h['slow'], vt)
+                _h['fast'] = (torch.zeros_like(hf_f), hf_f)
+                _h['mid']  = (torch.zeros_like(hf_m), hf_m)
+                _h['slow'] = (torch.zeros_like(hf_s), hf_s)
+                reg_mean = (reg_f + reg_m + reg_s) / 3.0
+                lv = torch.log1p(vt.abs())
+                vov = (lv - prev_lv).abs() if prev_lv is not None else torch.zeros_like(lv)
+                prev_lv = lv.detach()
+                regime_list.append(reg_mean.mean(dim=-1, keepdim=True))  # (B,1)
+                logvol_list.append(lv.mean(dim=-1, keepdim=True))
+                vov_list.append(vov.mean(dim=-1, keepdim=True))
+            # stack: (T, B, 1) -> mean over batch -> (T, 1) for z-score
+            seq_regime = torch.stack(regime_list, dim=0).mean(dim=1)  # (T, 1)
+            seq_logvol = torch.stack(logvol_list, dim=0).mean(dim=1)
+            seq_vov    = torch.stack(vov_list,    dim=0).mean(dim=1)
+            seq_ctx_raw = torch.cat([seq_regime, seq_logvol, seq_vov], dim=-1)  # (T, 3)
+            seq_ctx_norm = self._seq_zscore(seq_ctx_raw)  # (T, 3) normalised
+        else:
+            seq_ctx_norm = None
+        # -------------------------------------------------------------------
 
         means, stds = [], []
         all_regime, all_scale_weights = [], []
@@ -148,9 +195,8 @@ class MultiScaleCASARNN(nn.Module):
         all_danger      = []
         all_fused       = []
         all_regime_t    = []
-        all_latent_w    = []   # v0.5: latent expert weights for logging
+        all_latent_w    = []
         total_pred_err  = torch.zeros(1, device=device)
-        # v0.5: curriculum difficulty accumulator (max danger per sequence)
         max_danger      = torch.zeros(1, device=device)
 
         prev_log_vol = None
@@ -227,7 +273,13 @@ class MultiScaleCASARNN(nn.Module):
 
                 w = router_weights
 
-                ctx   = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)
+                # v0.6.1: use sequence-level normalised ctx if available
+                if seq_ctx_norm is not None:
+                    ctx_vec = seq_ctx_norm[t].unsqueeze(0).expand(batch, -1)  # (B, 3)
+                    ctx     = ctx_vec.unsqueeze(1)                             # (B, 1, 3)
+                else:
+                    ctx = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)
+
                 h_t   = fused.unsqueeze(1)
                 rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)
 
@@ -274,7 +326,6 @@ class MultiScaleCASARNN(nn.Module):
                 fused  = h_t.squeeze(1) + w_tda * tda_h_base * 0.1
                 h_t    = fused.unsqueeze(1)
 
-                # v0.5: latent expert bank — runs after bio modules
                 fused_latent, expert_states, latent_w = self.latent_experts(
                     h_t.squeeze(1), expert_states
                 )
@@ -385,8 +436,7 @@ class MultiScaleCASARNN(nn.Module):
             "router_temperature":      self.router.temperature.item() if self.use_bio else None,
             "regime_consistency_loss": regime_consist_loss,
             "contrastive_loss":        contrastive_loss,
-            # v0.5: new fields
             "latent_expert_weights":   latent_w_mean,
-            "curriculum_weight":       max_danger.item(),  # training loop can use this as difficulty score
+            "curriculum_weight":       max_danger.item(),
         }
         return means, stds, extra
