@@ -27,18 +27,23 @@ model = MultiScaleCASARNN(
     use_memory=True,
     memory_slots=32,
     regime_reset_threshold=0.15,
+    hidden_decay_rate=0.3,
 ).to(device)
 
 optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-loss_fn   = CounterfactualLoss(alpha=0.1, beta=0.01, gamma=0.05, use_nll=True)
+loss_fn   = CounterfactualLoss(
+    alpha=0.1, beta=0.01, gamma=0.05,
+    use_nll=True,
+    nll_clamp=3.0,     # clamp per-element NLL to stop std explosion from dominating
+)
 
-# Fix 1: CosineAnnealingWarmRestarts -> warm restart every 100 steps
-# so the model gets a chance to re-adapt after regime switches
+# Warm restart every 100 steps
 scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
     optimizer, T_0=100, T_mult=1, eta_min=1e-5
 )
 
-best_loss = float("inf")
+best_loss  = float("inf")
+prev_regime_flag = 0
 
 for step in range(400):
     x, y = make_batch(step)
@@ -50,11 +55,24 @@ for step in range(400):
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+    scheduler.step(step)
 
-    # Fix 2: .detach().item() before passing to scheduler
-    scheduler.step(step + loss.detach().item() * 0)
+    loss_val   = loss.detach().item()
+    regime_now = (step // 200) % 2
 
-    loss_val = loss.detach().item()
+    # Detect regime switch and reset optimizer momentum
+    # This is the key fix: Adam's momentum carries stale gradient direction
+    # from the old regime. Resetting exp_avg on switch lets it re-adapt quickly.
+    if regime_now != prev_regime_flag:
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                state = optimizer.state[p]
+                if 'exp_avg' in state:
+                    state['exp_avg'].mul_(0.1)       # decay momentum heavily
+                    state['exp_avg_sq'].mul_(0.5)    # decay second moment partially
+        prev_regime_flag = regime_now
+        print(f"  >>> Regime switch at step {step}: optimizer momentum reset <<<")
+
     if loss_val < best_loss:
         best_loss = loss_val
 

@@ -12,11 +12,10 @@ class MultiScaleCASARNN(nn.Module):
     Three parallel CASARNNCells at different temporal scales,
     fused with learned attention.
 
-    Fixes vs v0.1:
-    - MemoryBank.read() now receives regime_prob for regime-conditioned reads
-    - Hidden states are carried across batches optionally (stateful mode)
-    - regime_reset: if regime delta is large, partially reset fast hidden state
-      so the model doesn't carry stale memory into a new regime
+    Regime-switch recovery improvements:
+    - Soft hidden decay: smooth exponential decay instead of hard multiply
+    - Decay applied to ALL three scales proportional to regime delta
+    - prev_regime EMA updated smoothly to avoid false triggers
     """
 
     def __init__(
@@ -28,11 +27,13 @@ class MultiScaleCASARNN(nn.Module):
         use_memory: bool = True,
         memory_slots: int = 32,
         regime_reset_threshold: float = 0.15,
+        hidden_decay_rate: float = 0.3,    # max fraction of h_fast to zero out
     ):
         super().__init__()
         self.hidden_size             = hidden_size
         self.use_memory              = use_memory
         self.regime_reset_threshold  = regime_reset_threshold
+        self.hidden_decay_rate       = hidden_decay_rate
 
         self.cell_fast = CASARNNCell(input_size, hidden_size, dropout=dropout)
         self.cell_mid  = CASARNNCell(input_size, hidden_size, dropout=dropout)
@@ -48,19 +49,28 @@ class MultiScaleCASARNN(nn.Module):
             self.memory = MemoryBank(
                 hidden_size,
                 num_slots=memory_slots,
-                write_threshold=0.12,   # tuned: trigger on smaller delta
+                write_threshold=0.12,
             )
 
         self.head    = UncertaintyGatedHead(hidden_size, output_size)
         self.dropout = nn.Dropout(dropout)
         self.output_size = output_size
 
-        # Track previous regime for reset logic
-        self.register_buffer("prev_regime", torch.tensor(0.5))
+        # EMA of regime for smooth transition detection
+        self.register_buffer("regime_ema", torch.tensor(0.5))
 
     def _init_hidden(self, batch: int, device: torch.device) -> Dict:
         z = lambda: torch.zeros(batch, self.hidden_size, device=device)
         return {'fast': (z(), z()), 'mid': (z(), z()), 'slow': (z(), z())}
+
+    def _soft_decay(self, h: torch.Tensor, delta: float) -> torch.Tensor:
+        """
+        Soft exponential decay on fast hidden state.
+        delta in [0, 1] -> decay in [0, hidden_decay_rate]
+        Returns h * (1 - decay_fraction) so some signal is preserved.
+        """
+        decay = min(delta, 1.0) * self.hidden_decay_rate
+        return h * (1.0 - decay)
 
     def forward(
         self,
@@ -85,17 +95,18 @@ class MultiScaleCASARNN(nn.Module):
             hs_m, hf_m, reg_m, pe_m = self.cell_mid (xt, *hidden['mid'],  vt)
             hs_s, hf_s, reg_s, pe_s = self.cell_slow(xt, *hidden['slow'], vt)
 
-            # Regime consensus across scales
             regime_mean = (reg_f + reg_m + reg_s) / 3.0  # (B,)
+            r_now       = regime_mean.mean().detach()
 
-            # Regime reset: if regime shifted sharply, decay fast hidden state
-            # so stale short-term memory doesn't pollute the new regime
-            regime_delta = (regime_mean.mean() - self.prev_regime).abs().detach()
-            if regime_delta > self.regime_reset_threshold:
-                decay = 1.0 - regime_delta.clamp(0.0, 0.8).item()
-                hf_f = hf_f * decay
-                hf_m = hf_m * decay
-            self.prev_regime = regime_mean.mean().detach()
+            # Smooth regime delta against EMA
+            delta = (r_now - self.regime_ema).abs().item()
+            self.regime_ema = 0.9 * self.regime_ema + 0.1 * r_now
+
+            # Apply soft hidden decay only when transition detected
+            if delta > self.regime_reset_threshold:
+                hf_f = self._soft_decay(hf_f, delta)
+                hf_m = self._soft_decay(hf_m, delta)
+                # h_slow intentionally NOT decayed: it should carry regime memory
 
             hidden['fast'] = (hs_f, hf_f)
             hidden['mid']  = (hs_m, hf_m)
@@ -103,15 +114,13 @@ class MultiScaleCASARNN(nn.Module):
 
             total_pred_err = total_pred_err + pe_f.mean() + pe_m.mean() + pe_s.mean()
 
-            # Attention fusion
             concat  = torch.cat([hf_f, hf_m, hf_s], dim=-1)
-            weights = torch.softmax(self.scale_attn(concat), dim=-1)  # (B, 3)
+            weights = torch.softmax(self.scale_attn(concat), dim=-1)
             fused   = (weights[:, 0:1] * hf_f +
                        weights[:, 1:2] * hf_m +
                        weights[:, 2:3] * hf_s)
             fused   = self.dropout(fused)
 
-            # Memory bank: regime-conditioned read + transition-triggered write
             if self.use_memory:
                 self.memory.write(fused, regime_mean)
                 fused = self.memory.read(fused, regime_mean)
