@@ -1,17 +1,42 @@
-"""CASA-RNN: Causal Adaptive State Autoregressive RNN."""
-from .cell import CASARNNCell
-from .multiscale import MultiScaleCASARNN
-from .loss import CounterfactualLoss
-from .genome import FeatureGenome, SoftOpBank, CrossFeatureInteraction, TemporalGenome
+"""CASA-RNN: Causal Adaptive State Autoregressive RNN for financial markets."""
 from .model import CASARNNModel
+from .loss import CounterfactualLoss
+from .conformal import ConformalWrapper
+from .cpg import CPGEncoder
+from .astrocyte import AstrocyteModulator
+from .danger import DangerSignalDetector
+from .tda_features import TDAFeatureExtractor
+from .neuro_modules import (
+    NeuromodulatorGating,
+    ThalamicAttention,
+    HippocampalReplayBuffer,
+    PrefrontalWorkingMemory,
+    MetaLearningStrategyBank,
+    RegimeTransitionDetector,
+    CerebellarForwardModel,
+    HomeostaticGainControl,
+    SoftModuleRouter,
+    MODULE_NAMES,
+    STRATEGY_NAMES,
+)
 
 __all__ = [
-    "CASARNNCell",
-    "MultiScaleCASARNN",
-    "CounterfactualLoss",
-    "FeatureGenome",
-    "SoftOpBank",
-    "CrossFeatureInteraction",
-    "TemporalGenome",
     "CASARNNModel",
+    "CounterfactualLoss",
+    "ConformalWrapper",
+    "CPGEncoder",
+    "AstrocyteModulator",
+    "DangerSignalDetector",
+    "TDAFeatureExtractor",
+    "NeuromodulatorGating",
+    "ThalamicAttention",
+    "HippocampalReplayBuffer",
+    "PrefrontalWorkingMemory",
+    "MetaLearningStrategyBank",
+    "RegimeTransitionDetector",
+    "CerebellarForwardModel",
+    "HomeostaticGainControl",
+    "SoftModuleRouter",
+    "MODULE_NAMES",
+    "STRATEGY_NAMES",
 ]
