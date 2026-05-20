@@ -10,13 +10,11 @@ Outputs
 * value            : (B, 1)   critic estimate of expected return
                               (used during RL fine-tuning, ignored at inference)
 
-The actor and critic share the encoder.  Only the heads are separate.
-This is standard Actor-Critic (used in PPO).
-
-Inference usage (live trading)
-------------------------------
-    actor = BTCActor.load("checkpoint.pt")
-    signal = actor.get_signal(ohlcv_window)   # returns {action, confidence, probs}
+Fix log (v2)
+------------
+* _init_weights: gain 0.01 -> 1.0 (orthogonal).  gain=0.01 caused near-zero
+  outputs and vanishing gradients from the very first forward pass.
+* Encoder layers (stem, pos_emb) use their own init -- not overridden here.
 """
 
 from __future__ import annotations
@@ -53,15 +51,15 @@ class BTCActor(nn.Module):
             dropout=dropout,
         )
 
-        # Policy head (actor)
+        # Policy head
         self.policy_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 3),   # LONG / FLAT / SHORT
+            nn.Linear(d_model // 2, 3),
         )
 
-        # Confidence head -- separate from policy to avoid entanglement
+        # Confidence head
         self.confidence_head = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.GELU(),
@@ -69,7 +67,7 @@ class BTCActor(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Value head (critic, used only during PPO fine-tuning)
+        # Value head (critic, PPO only)
         self.value_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
@@ -79,39 +77,37 @@ class BTCActor(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Only initialise the head layers -- encoder handles its own init.
+        # gain=1.0 (default orthogonal) gives healthy gradient magnitude.
+        for mod in [self.policy_head, self.confidence_head, self.value_head]:
+            for m in mod.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=1.0)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        # Final policy layer: small init so initial logits are near-uniform
+        # (avoids the model collapsing to one class immediately)
+        last_policy = [m for m in self.policy_head.modules() if isinstance(m, nn.Linear)][-1]
+        nn.init.orthogonal_(last_policy.weight, gain=0.1)
 
     def forward(self, x: torch.Tensor):
-        """
-        x : (B, T, C)  raw OHLCV window
-        returns logits (B,3), confidence (B,1), value (B,1)
-        """
-        ctx = self.encoder(x)                          # (B, d_model)
-        logits = self.policy_head(ctx)                 # (B, 3)
-        conf   = self.confidence_head(ctx)             # (B, 1)
-        value  = self.value_head(ctx)                  # (B, 1)
+        ctx    = self.encoder(x)
+        logits = self.policy_head(ctx)
+        conf   = self.confidence_head(ctx)
+        value  = self.value_head(ctx)
         return logits, conf, value
-
-    # ------------------------------------------------------------------
-    # Convenience helpers
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def get_signal(self, ohlcv: torch.Tensor) -> Dict:
         """
-        Live inference.  ohlcv can be (T, C) or (1, T, C).
-        Returns a dict ready for downstream trading logic.
+        Live inference.  ohlcv: (T, C) or (1, T, C)
         """
         self.eval()
         if ohlcv.dim() == 2:
-            ohlcv = ohlcv.unsqueeze(0)          # add batch dim
+            ohlcv = ohlcv.unsqueeze(0)
         logits, conf, _ = self(ohlcv)
-        probs  = F.softmax(logits, dim=-1)      # (1, 3)
-        action = probs.argmax(dim=-1).item()    # 0=LONG 1=FLAT 2=SHORT
+        probs  = F.softmax(logits, dim=-1)
+        action = probs.argmax(dim=-1).item()
         return {
             "action":     action,
             "action_str": ACTION_NAMES[action],
@@ -123,7 +119,7 @@ class BTCActor(nn.Module):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "state_dict":  self.state_dict(),
+            "state_dict": self.state_dict(),
             "config": {
                 "in_channels": self.encoder.stem.in_features // self.encoder.patch_size,
                 "patch_size":  self.encoder.patch_size,
