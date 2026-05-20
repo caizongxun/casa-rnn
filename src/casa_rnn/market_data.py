@@ -3,15 +3,14 @@ market_data.py -- Auto-discovery, validation, and enrichment of market data.
 
 Design goals:
   1. Scan a data directory for CSV/zip files in Binance Data Vision format.
-  2. For each required correlated asset (ETH, SOL, BNB, etc.):
+  2. For ALL symbols (primary + correlated):
        a. Check if a local file exists.
-       b. If not: try downloading from Binance public REST API (no key needed).
-       c. If download fails: print a clear human-readable message with exact
-          instructions on where to get the file.
-  3. Build enriched feature columns from Binance Data Vision's raw columns:
-       taker_buy_ratio, volume_delta, close_strength, vol_momentum,
-       momentum_diff (fast-slow).
-  4. Compute cross-asset correlation features when correlated data is available.
+       b. If not and auto_download=True: download from Binance public REST API
+          (no API key needed). Default start date: 2020-01-01.
+       c. If download fails: print clear human-readable instructions and raise
+          (primary) or skip (correlated).
+  3. Build enriched feature columns from Binance Data Vision raw columns.
+  4. Compute cross-asset correlation features when correlated data available.
 
 Binance Data Vision CSV columns (fixed order):
   0  open_time          ms timestamp
@@ -31,7 +30,6 @@ Binance Data Vision CSV columns (fixed order):
 from __future__ import annotations
 
 import io
-import os
 import re
 import time
 import zipfile
@@ -53,40 +51,18 @@ BINANCE_DV_COLS = [
     "taker_buy_volume", "taker_buy_quote_volume", "ignore",
 ]
 
-# Correlated assets we'd like to use as auxiliary signals
 DEFAULT_CORR_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-
-# Data directory relative to cwd (can be overridden)
-DEFAULT_DATA_DIR = Path("data")
+DEFAULT_DATA_DIR     = Path("data")
+DEFAULT_START_DATE   = "2020-01-01"   # used when auto-downloading primary symbol
 
 
 # ---------------------------------------------------------------------------
-# DataRegistry: scans local filesystem for available market data
+# DataRegistry
 # ---------------------------------------------------------------------------
 
 class DataRegistry:
-    """
-    Scans a directory for Binance Data Vision CSV/zip files.
-
-    Expected filename conventions (all accepted):
-        BTCUSDT-1h-2024-01.csv
-        BTCUSDT-1h-2024-01.zip
-        BTCUSDT-1h-*.csv  (any date suffix)
-        btcusdt_1h.csv    (legacy flat files)
-
-    After init, self.files maps (symbol_upper, interval) -> List[Path].
-    """
-
-    # Binance Data Vision pattern: SYMBOL-INTERVAL-YYYY-MM[.csv|.zip]
-    _BDV_RE = re.compile(
-        r"(?P<symbol>[A-Za-z0-9]+)-(?P<interval>[0-9]+[mhd])-",
-        re.IGNORECASE,
-    )
-    # Legacy flat file pattern: symbol_interval.csv
-    _LEGACY_RE = re.compile(
-        r"(?P<symbol>[A-Za-z0-9]+)[_-](?P<interval>[0-9]+[mhd])\.(csv|zip)$",
-        re.IGNORECASE,
-    )
+    _BDV_RE    = re.compile(r"(?P<symbol>[A-Za-z0-9]+)-(?P<interval>[0-9]+[mhd])-", re.IGNORECASE)
+    _LEGACY_RE = re.compile(r"(?P<symbol>[A-Za-z0-9]+)[_-](?P<interval>[0-9]+[mhd])\.(csv|zip)$", re.IGNORECASE)
 
     def __init__(self, data_dir: Path = DEFAULT_DATA_DIR):
         self.data_dir = Path(data_dir)
@@ -99,16 +75,12 @@ class DataRegistry:
         for p in sorted(self.data_dir.rglob("*")):
             if p.suffix not in (".csv", ".zip"):
                 continue
-            name = p.name
-            m = self._BDV_RE.match(name)
-            if m:
-                key = (m.group("symbol").upper(), m.group("interval").lower())
-                self.files.setdefault(key, []).append(p)
-                continue
-            m = self._LEGACY_RE.match(name)
-            if m:
-                key = (m.group("symbol").upper(), m.group("interval").lower())
-                self.files.setdefault(key, []).append(p)
+            for pattern in (self._BDV_RE, self._LEGACY_RE):
+                m = pattern.match(p.name)
+                if m:
+                    key = (m.group("symbol").upper(), m.group("interval").lower())
+                    self.files.setdefault(key, []).append(p)
+                    break
 
     def has(self, symbol: str, interval: str) -> bool:
         return (symbol.upper(), interval.lower()) in self.files
@@ -116,21 +88,25 @@ class DataRegistry:
     def get_paths(self, symbol: str, interval: str) -> List[Path]:
         return self.files.get((symbol.upper(), interval.lower()), [])
 
+    def register(self, symbol: str, interval: str, path: Path):
+        """Add a newly downloaded file to the registry without re-scanning."""
+        key = (symbol.upper(), interval.lower())
+        self.files.setdefault(key, []).append(path)
+
     def summary(self) -> str:
         lines = [f"DataRegistry ({self.data_dir}):"]
         if not self.files:
-            lines.append("  (empty)")
+            lines.append("  (empty — will auto-download)")
         for (sym, iv), paths in sorted(self.files.items()):
             lines.append(f"  {sym} {iv}: {len(paths)} file(s)")
         return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# CSV loading (handles zip + bare csv, Binance Data Vision format)
+# CSV loading
 # ---------------------------------------------------------------------------
 
 def _read_bdv_csv(path: Path) -> pd.DataFrame:
-    """Read one Binance Data Vision CSV or zip into a DataFrame."""
     if path.suffix == ".zip":
         with zipfile.ZipFile(path) as zf:
             csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
@@ -140,19 +116,16 @@ def _read_bdv_csv(path: Path) -> pd.DataFrame:
                 raw = f.read()
         buf = io.StringIO(raw.decode("utf-8"))
     else:
-        buf = path
+        buf = path  # type: ignore[assignment]
 
     df = pd.read_csv(buf, header=None)
 
-    # Accept files with or without a header row
-    if df.iloc[0, 0] == "open_time":
+    if str(df.iloc[0, 0]).lower() == "open_time":
         df = df.iloc[1:].reset_index(drop=True)
 
-    # Assign standard column names if the file has >= 12 columns
     if df.shape[1] >= 12:
         df.columns = BINANCE_DV_COLS[:df.shape[1]]
     elif df.shape[1] >= 6:
-        # Minimal OHLCV
         df.columns = ["open_time", "open", "high", "low", "close", "volume"] + \
                      [f"_c{i}" for i in range(df.shape[1] - 6)]
     else:
@@ -167,12 +140,10 @@ def _read_bdv_csv(path: Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
-    return df
+    return df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
 
 
 def load_symbol(symbol: str, interval: str, registry: DataRegistry) -> Optional[pd.DataFrame]:
-    """Load and concatenate all local files for a symbol+interval."""
     paths = registry.get_paths(symbol, interval)
     if not paths:
         return None
@@ -185,12 +156,11 @@ def load_symbol(symbol: str, interval: str, registry: DataRegistry) -> Optional[
     if not frames:
         return None
     df = pd.concat(frames, ignore_index=True)
-    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
-    return df
+    return df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Binance public REST API fallback (no API key required)
+# Binance public REST API download (no key required)
 # ---------------------------------------------------------------------------
 
 def _download_klines_api(
@@ -201,30 +171,23 @@ def _download_klines_api(
     save_path: Path,
     max_retries: int = 3,
 ) -> Optional[pd.DataFrame]:
-    """
-    Download klines from Binance public REST API and save as CSV.
-    Handles pagination automatically (500 candles per request).
-    """
     try:
         import requests
     except ImportError:
         print("  [market_data] 'requests' not installed. Run: pip install requests")
         return None
 
-    all_rows = []
+    all_rows: list = []
     current_start = start_ms
     limit = 500
 
-    print(f"  [market_data] Downloading {symbol} {interval} from Binance API ...", flush=True)
+    print(f"  [market_data] Downloading {symbol} {interval} "
+          f"({pd.Timestamp(start_ms, unit='ms').date()} -> "
+          f"{pd.Timestamp(end_ms,   unit='ms').date()}) ...", flush=True)
 
     while current_start < end_ms:
-        params = {
-            "symbol": symbol.upper(),
-            "interval": interval,
-            "startTime": current_start,
-            "endTime": end_ms,
-            "limit": limit,
-        }
+        params = dict(symbol=symbol.upper(), interval=interval,
+                      startTime=current_start, endTime=end_ms, limit=limit)
         for attempt in range(max_retries):
             try:
                 resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
@@ -239,92 +202,88 @@ def _download_klines_api(
 
         if not data:
             break
-
         all_rows.extend(data)
         last_open_time = data[-1][0]
         if last_open_time >= end_ms or len(data) < limit:
             break
         current_start = last_open_time + 1
-        time.sleep(0.1)  # polite rate limiting
+        time.sleep(0.1)
 
     if not all_rows:
+        print(f"  [market_data] No data returned for {symbol} {interval}")
         return None
 
-    df = pd.DataFrame(all_rows, columns=BINANCE_DV_COLS)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(all_rows, columns=BINANCE_DV_COLS)
     df.to_csv(save_path, index=False, header=False)
-    print(f"  [market_data] Saved {len(df)} candles to {save_path}")
-
-    # Parse and return
+    print(f"  [market_data] Saved {len(df):,} candles -> {save_path}")
     return _read_bdv_csv(save_path)
 
 
+def _auto_download(
+    symbol: str,
+    interval: str,
+    data_dir: Path,
+    registry: DataRegistry,
+    ref_df: Optional[pd.DataFrame] = None,   # align date range to primary symbol
+) -> Optional[pd.DataFrame]:
+    """Try to download symbol from Binance API and register the result."""
+    if ref_df is not None:
+        start_ms = int(ref_df["open_time"].min().timestamp() * 1000)
+        end_ms   = int(ref_df["open_time"].max().timestamp() * 1000)
+    else:
+        start_ms = int(pd.Timestamp(DEFAULT_START_DATE, tz="UTC").timestamp() * 1000)
+        end_ms   = int(pd.Timestamp.utcnow().timestamp() * 1000)
+
+    save_path = data_dir / f"{symbol}-{interval}-api.csv"
+    df = _download_klines_api(symbol, interval, start_ms, end_ms, save_path)
+    if df is not None:
+        registry.register(symbol, interval, save_path)
+    return df
+
+
 # ---------------------------------------------------------------------------
-# Feature engineering: enriched columns from Binance Data Vision raw data
+# Feature engineering
 # ---------------------------------------------------------------------------
 
 def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add sentiment-proxy and momentum features to a Binance DV DataFrame.
-
-    New columns added:
-        taker_buy_ratio    -- active buy pressure (0-1)
-        volume_delta_norm  -- normalised net buy/sell volume
-        close_strength     -- candle close position in [low, high]
-        vol_momentum       -- short vs long-term volume ratio
-        momentum_5         -- 5-bar price momentum
-        momentum_20        -- 20-bar price momentum
-        momentum_diff      -- fast minus slow momentum
-        log_return         -- if not present
-        hl_range           -- (high-low)/close normalised range
-        vol_ma20_ratio     -- volume / 20-bar mean volume
-        rsi14              -- 14-bar RSI
-        atr14              -- 14-bar ATR (normalised by close)
-    """
     df = df.copy()
 
-    # --- Sentiment proxies (from Binance DV columns) ---
     if "taker_buy_volume" in df.columns and "volume" in df.columns:
         vol_safe = df["volume"].clip(lower=1e-8)
         df["taker_buy_ratio"]   = (df["taker_buy_volume"] / vol_safe).clip(0, 1)
-        df["volume_delta_norm"] = (2.0 * df["taker_buy_ratio"] - 1.0)  # range [-1, 1]
+        df["volume_delta_norm"] = 2.0 * df["taker_buy_ratio"] - 1.0
     else:
         df["taker_buy_ratio"]   = 0.5
         df["volume_delta_norm"] = 0.0
 
-    # --- K-bar shape ---
     hl = (df["high"] - df["low"]).clip(lower=1e-8)
     df["close_strength"] = ((df["close"] - df["low"]) / hl).clip(0, 1)
 
-    # --- Volume momentum ---
     vol_ma5  = df["volume"].rolling(5,  min_periods=1).mean()
     vol_ma20 = df["volume"].rolling(20, min_periods=1).mean().clip(lower=1e-8)
     df["vol_momentum"]   = (vol_ma5 / vol_ma20).clip(0, 5)
     df["vol_ma20_ratio"] = df["volume"] / vol_ma20
 
-    # --- Price momentum ---
-    df["momentum_5"]  = df["close"].pct_change(5).fillna(0)
-    df["momentum_20"] = df["close"].pct_change(20).fillna(0)
+    df["momentum_5"]    = df["close"].pct_change(5).fillna(0)
+    df["momentum_20"]   = df["close"].pct_change(20).fillna(0)
     df["momentum_diff"] = df["momentum_5"] - df["momentum_20"]
 
-    # --- Standard features ---
     df["log_return"] = np.log(df["close"] / df["close"].shift(1).clip(lower=1e-8)).fillna(0)
     df["hl_range"]   = (df["high"] - df["low"]) / df["close"].clip(lower=1e-8)
 
-    # --- RSI 14 ---
     delta = df["close"].diff()
     gain  = delta.clip(lower=0).rolling(14, min_periods=1).mean()
     loss  = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean().clip(lower=1e-8)
-    df["rsi14"] = (100 - 100 / (1 + gain / loss)) / 100.0  # normalised to [0,1]
+    df["rsi14"] = (100 - 100 / (1 + gain / loss)) / 100.0
 
-    # --- ATR 14 ---
     prev_close = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - prev_close).abs(),
         (df["low"]  - prev_close).abs(),
     ], axis=1).max(axis=1)
-    df["atr14"] = (tr.rolling(14, min_periods=1).mean() / df["close"].clip(lower=1e-8))
+    df["atr14"] = tr.rolling(14, min_periods=1).mean() / df["close"].clip(lower=1e-8)
 
     return df
 
@@ -338,21 +297,6 @@ def build_correlation_features(
     corr_dfs: Dict[str, pd.DataFrame],
     windows: List[int] = (24, 72, 168),
 ) -> pd.DataFrame:
-    """
-    Compute cross-asset features aligned to BTC timestamps.
-
-    For each correlated asset:
-        - rolling_corr_{symbol}_{window}h  : rolling price correlation with BTC
-        - rel_momentum_{symbol}            : asset 5-bar momentum minus BTC momentum
-
-    Args:
-        btc_df    : enriched BTC DataFrame (must have open_time, log_return)
-        corr_dfs  : {symbol: enriched DataFrame} for each correlated asset
-        windows   : rolling windows in bars (default: 24h, 72h, 168h for 1h data)
-
-    Returns:
-        btc_df with additional columns appended.
-    """
     result = btc_df.set_index("open_time").copy()
 
     for symbol, cdf in corr_dfs.items():
@@ -362,15 +306,13 @@ def build_correlation_features(
         result[f"lr_{sym_short}"] = result[f"lr_{sym_short}"].fillna(0)
 
         for w in windows:
-            col = f"corr_{sym_short}_{w}h"
-            result[col] = (
+            result[f"corr_{sym_short}_{w}h"] = (
                 result["log_return"]
                 .rolling(w, min_periods=max(2, w // 4))
                 .corr(result[f"lr_{sym_short}"])
                 .fillna(0)
             )
 
-        # Relative momentum: if corr asset has momentum_5, subtract BTC's
         if "momentum_5" in cdf.columns:
             mom_col = cdf.set_index("open_time")["momentum_5"].rename(f"mom_{sym_short}")
             result  = result.join(mom_col, how="left")
@@ -385,7 +327,7 @@ def build_correlation_features(
 
 
 # ---------------------------------------------------------------------------
-# High-level entry point
+# Main entry point
 # ---------------------------------------------------------------------------
 
 def load_and_enrich(
@@ -398,57 +340,62 @@ def load_and_enrich(
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    One-stop function: discover -> load -> enrich -> cross-asset features.
+    Discover -> (auto-download if missing) -> load -> enrich -> cross-asset features.
+
+    Primary symbol:
+      - If local file found: load it.
+      - If not found and auto_download=True: download from Binance API (2020-01-01 -> now).
+      - If download fails: raise FileNotFoundError with full instructions.
+
+    Correlated symbols:
+      - Same logic, but failure is non-fatal (skipped with a warning).
 
     Returns:
-        df        : enriched DataFrame ready for windowing
-        feat_cols : list of feature column names to feed the model
+        df        : enriched DataFrame
+        feat_cols : feature column names to pass to the model
     """
     data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
     registry = DataRegistry(data_dir)
 
     if verbose:
         print(registry.summary())
 
-    # --- Load primary symbol ---
+    # --- Primary symbol ---
     df = load_symbol(symbol, interval, registry)
     if df is None:
-        _print_missing_instructions(symbol, interval, data_dir)
-        raise FileNotFoundError(
-            f"Primary data not found: {symbol} {interval} in {data_dir}"
-        )
+        if auto_download:
+            print(f"[market_data] {symbol} {interval} not found locally. Downloading from Binance API ...")
+            df = _auto_download(symbol, interval, data_dir, registry)
+        if df is None:
+            _print_missing_instructions(symbol, interval, data_dir)
+            raise FileNotFoundError(f"Primary data not found: {symbol} {interval} in {data_dir}")
 
-    # Filter date range
     if date_range:
-        start, end = pd.Timestamp(date_range[0], tz="UTC"), pd.Timestamp(date_range[1], tz="UTC")
-        df = df[(df["open_time"] >= start) & (df["open_time"] <= end)].reset_index(drop=True)
+        s = pd.Timestamp(date_range[0], tz="UTC")
+        e = pd.Timestamp(date_range[1], tz="UTC")
+        df = df[(df["open_time"] >= s) & (df["open_time"] <= e)].reset_index(drop=True)
 
     df = enrich_features(df)
 
-    # --- Load correlated assets ---
+    # --- Correlated symbols ---
     corr_dfs: Dict[str, pd.DataFrame] = {}
     for csym in corr_symbols:
         cdf = load_symbol(csym, interval, registry)
+        if cdf is None and auto_download:
+            cdf = _auto_download(csym, interval, data_dir, registry, ref_df=df)
         if cdf is None:
-            if auto_download:
-                cdf = _try_download_corr(
-                    csym, interval, df, data_dir, verbose
-                )
-            if cdf is None:
-                if verbose:
-                    _print_missing_instructions(csym, interval, data_dir, is_corr=True)
-                continue  # skip this asset, not fatal
+            if verbose:
+                print(f"  [market_data] WARNING: {csym} {interval} unavailable, skipping.")
+            continue
         corr_dfs[csym] = enrich_features(cdf)
 
-    # --- Build cross-asset features ---
     if corr_dfs:
         df = build_correlation_features(df, corr_dfs)
 
-    # --- Define feature columns ---
     base_feats = [
         "open", "high", "low", "close", "volume",
         "log_return", "hl_range", "vol_ma20_ratio", "rsi14", "atr14",
-        # new sentiment + momentum features
         "taker_buy_ratio", "volume_delta_norm", "close_strength",
         "vol_momentum", "momentum_diff",
     ]
@@ -456,91 +403,51 @@ def load_and_enrich(
     feat_cols  = [f for f in base_feats + corr_feats if f in df.columns]
 
     if verbose:
-        print(f"\n[market_data] Primary: {symbol} {interval}  rows={len(df):,}")
-        print(f"[market_data] Correlated assets loaded: {list(corr_dfs.keys())}")
-        print(f"[market_data] Feature columns ({len(feat_cols)}): {feat_cols}")
+        print(f"\n[market_data] {symbol} {interval}  rows={len(df):,}")
+        print(f"[market_data] Correlated: {list(corr_dfs.keys())}")
+        print(f"[market_data] Features ({len(feat_cols)}): {feat_cols}")
 
     df = df.dropna(subset=["close", "log_return"]).reset_index(drop=True)
     return df, feat_cols
 
 
 # ---------------------------------------------------------------------------
-# Auto-download helper
-# ---------------------------------------------------------------------------
-
-def _try_download_corr(
-    symbol: str,
-    interval: str,
-    btc_df: pd.DataFrame,
-    data_dir: Path,
-    verbose: bool,
-) -> Optional[pd.DataFrame]:
-    """Attempt to download a correlated symbol from Binance API."""
-    try:
-        start_ms = int(btc_df["open_time"].min().timestamp() * 1000)
-        end_ms   = int(btc_df["open_time"].max().timestamp() * 1000)
-    except Exception:
-        return None
-
-    save_path = data_dir / f"{symbol}-{interval}-api.csv"
-    cdf = _download_klines_api(symbol, interval, start_ms, end_ms, save_path)
-    return cdf
-
-
-# ---------------------------------------------------------------------------
-# Human-readable instructions
+# Instructions helper
 # ---------------------------------------------------------------------------
 
 def _print_missing_instructions(symbol: str, interval: str, data_dir: Path, is_corr: bool = False):
-    prefix = "  [market_data]" if is_corr else "[market_data]"
-    severity = "WARNING" if is_corr else "ERROR"
+    tag = "WARNING" if is_corr else "ERROR"
     print(f"\n{'='*60}")
-    print(f"{prefix} {severity}: {symbol} {interval} data not found")
+    print(f"[market_data] {tag}: {symbol} {interval} data not found and auto-download failed")
     print(f"{'='*60}")
-    print(f"Expected location: {data_dir.resolve()}/")
-    print(f"")
-    print(f"Option 1 - Binance Data Vision (recommended):")
-    print(f"  1. Go to https://data.binance.vision/")
-    print(f"  2. Navigate to: data/spot/monthly/klines/{symbol}/{interval}/")
-    print(f"  3. Download all ZIP files you need")
-    print(f"  4. Place them in: {data_dir.resolve()}/")
-    print(f"  5. Filename format: {symbol}-{interval}-YYYY-MM.zip")
-    print(f"")
-    print(f"Option 2 - Auto download (Binance public API, no key needed):")
-    print(f"  Set auto_download=True in load_and_enrich() call")
-    print(f"  OR run: python -m casa_rnn.market_data --symbol {symbol} --interval {interval}")
-    print(f"")
-    print(f"Required CSV columns (Binance Data Vision standard):")
-    for i, col in enumerate(BINANCE_DV_COLS):
-        print(f"  col {i:2d}: {col}")
+    print(f"Manual option - Binance Data Vision:")
+    print(f"  1. https://data.binance.vision/")
+    print(f"  2. data/spot/monthly/klines/{symbol}/{interval}/")
+    print(f"  3. Place ZIP files in: {data_dir.resolve()}/")
+    print(f"  4. Filename: {symbol}-{interval}-YYYY-MM.zip")
     print(f"{'='*60}\n")
 
 
 # ---------------------------------------------------------------------------
-# CLI: python -m casa_rnn.market_data --symbol ETHUSDT --interval 1h
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser(description="Download market data from Binance public API")
-    parser.add_argument("--symbol",   default="ETHUSDT",  help="e.g. ETHUSDT")
-    parser.add_argument("--interval", default="1h",       help="e.g. 1h, 4h, 1d")
-    parser.add_argument("--start",    default="2020-01-01", help="start date YYYY-MM-DD")
-    parser.add_argument("--end",      default=None,       help="end date YYYY-MM-DD (default: now)")
-    parser.add_argument("--data-dir", default="data",     help="output directory")
+    parser.add_argument("--symbol",   default="BTCUSDT")
+    parser.add_argument("--interval", default="1h")
+    parser.add_argument("--start",    default=DEFAULT_START_DATE)
+    parser.add_argument("--end",      default=None)
+    parser.add_argument("--data-dir", default="data")
     args = parser.parse_args()
 
-    start_ts = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
-    end_ts   = int((pd.Timestamp(args.end, tz="UTC") if args.end
+    start_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
+    end_ms   = int((pd.Timestamp(args.end, tz="UTC") if args.end
                     else pd.Timestamp.utcnow()).timestamp() * 1000)
     out_dir  = Path(args.data_dir)
     out_path = out_dir / f"{args.symbol}-{args.interval}-api.csv"
 
-    result = _download_klines_api(
-        args.symbol, args.interval, start_ts, end_ts, out_path
-    )
+    result = _download_klines_api(args.symbol, args.interval, start_ms, end_ms, out_path)
     if result is not None:
-        print(f"Downloaded {len(result):,} candles for {args.symbol} {args.interval}")
-    else:
-        print("Download failed. Check network connection.")
+        print(f"Done: {len(result):,} candles for {args.symbol} {args.interval}")
