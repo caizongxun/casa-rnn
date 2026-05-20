@@ -9,6 +9,12 @@ Bio-neuro integration (deep):
   3. PrefrontalWorkingMemory - maintains orthogonal context/content subspaces
                                with RPE-controlled input gate
   4. MemoryBank read (existing, now reads from bio-modulated h)
+
+Shape reference:
+  pe_f / pe_m / pe_s : (B, 1)   <- cell returns pred_error with keepdim=True
+  rpe_scalar         : (B, 1)
+  rpe_t              : (B, 1, 1) <- one unsqueeze to add T dim
+  h_t                : (B, 1, H)
 """
 import torch
 import torch.nn as nn
@@ -99,6 +105,7 @@ class MultiScaleCASARNN(nn.Module):
             xt = x[:, t, :]
             vt = vol_indicator[:, t, :] if vol_indicator is not None else None
 
+            # pe_f, pe_m, pe_s: (B, 1)  <-- cell returns keepdim=True
             hs_f, hf_f, reg_f, pe_f = self.cell_fast(xt, *hidden['fast'], vt)
             hs_m, hf_m, reg_m, pe_m = self.cell_mid (xt, *hidden['mid'],  vt)
             hs_s, hf_s, reg_s, pe_s = self.cell_slow(xt, *hidden['slow'], vt)
@@ -141,13 +148,12 @@ class MultiScaleCASARNN(nn.Module):
                 h_t, neuro_levels = self.neuro_gate(h_t, ctx)             # (B, 1, H)
 
                 # 3. PrefrontalWorkingMemory
-                # pe_f/pe_m/pe_s are scalars (B,) after .mean() in cell
-                # rpe_t must be 3D: (B, 1, 1) to concat with h_t (B, 1, H)
-                rpe_scalar = (pe_f + pe_m + pe_s) / 3.0       # (B,)
-                rpe_t = rpe_scalar.unsqueeze(1).unsqueeze(1)   # (B, 1, 1)
-                h_t   = self.pfc_wm(h_t, rpe=rpe_t)           # (B, 1, H)
+                # pe_f is (B, 1) due to keepdim=True in cell
+                # -> unsqueeze once to add T dim -> (B, 1, 1), matches h_t (B, 1, H)
+                rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)        # (B, 1, 1)
+                h_t   = self.pfc_wm(h_t, rpe=rpe_t)                      # (B, 1, H)
 
-                fused = h_t.squeeze(1)                         # (B, H)
+                fused = h_t.squeeze(1)                                    # (B, H)
 
                 for k, v in neuro_levels.items():
                     all_neuro[k].append(v)
