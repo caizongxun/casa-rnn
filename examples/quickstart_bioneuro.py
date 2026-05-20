@@ -1,11 +1,11 @@
 """
-Bio-Neuro Quickstart: deep integration + meta learning strategies.
+Bio-Neuro Quickstart v5: Transition Detector + Cerebellum + Homeostasis.
 
-Fixes in this version:
-1. BioConstraintLoss: enforces NE ~ vol_of_vol and DA ~ RPE semantics
-2. StrategyEntropyLoss: prevents strategy bank from collapsing to one mode
-3. vol/rpe tensors passed through to loss for constraint computation
-4. entropy warmup toned down so task loss remains dominant
+New in this version:
+1. RegimeTransitionDetector: explicit BCE auxiliary task for transitions
+2. CerebellarForwardModel: internal next-state predictor, refines RPE
+3. HomeostaticGainControl: allostatic setpoint loss prevents DA/NE saturation
+4. transition_label fed into model.forward() so detector can actually train
 """
 import torch
 import torch.optim as optim
@@ -34,6 +34,14 @@ def regime_weight(step):
         d = 1.0 if i % 2 == 0 else -1.0
         w += d / (1.0 + math.exp(-(step - sw) / TRANS * 6))
     return max(0.0, min(1.0, w))
+
+
+def is_transition(step, half_window=25):
+    """Returns 1.0 if within half_window steps of any switch point."""
+    for sw in SWITCH:
+        if abs(step - sw) <= half_window:
+            return 1.0
+    return 0.0
 
 
 def entropy_weight(step):
@@ -66,8 +74,9 @@ model = CASARNNModel(
     use_bio=True,
 ).to(device)
 
-replay_buf   = HippocampalReplayBuffer(capacity=300, replay_every=25)
-bio_loss_fn  = BioConstraintLoss(ne_weight=0.05, da_weight=0.05)
+replay_buf  = HippocampalReplayBuffer(capacity=300, replay_every=25)
+bio_loss_fn = BioConstraintLoss(ne_weight=0.05, da_weight=0.05)
+
 alpha_params = [model.genome.soft_op.alpha]
 other_params = [p for n, p in model.named_parameters() if 'soft_op.alpha' not in n]
 optimizer    = optim.AdamW([
@@ -83,8 +92,9 @@ prev_rw   = 0.0
 
 for step in range(TOTAL):
     x, y, vol, rw = make_batch(step)
+    trans_label   = is_transition(step)
     optimizer.zero_grad()
-    means, stds, extra = model(x, vol_indicator=vol)
+    means, stds, extra = model(x, vol_indicator=vol, transition_label=trans_label)
 
     with torch.no_grad():
         rpe_scalar = (means - y).abs().mean().item()
@@ -93,6 +103,7 @@ for step in range(TOTAL):
     ent_w     = entropy_weight(step)
     loss      = task_loss + ent_w * model.genome.alpha_entropy_loss()
 
+    # Bio constraint: NE ~ vol_of_vol, DA ~ RPE
     neuro_tensors = extra.get("neuro_tensors", {})
     vov           = extra.get("vol_of_vol", None)
     rpe_tensor    = extra.get("rpe_tensor", None)
@@ -104,17 +115,35 @@ for step in range(TOTAL):
             rpe=rpe_tensor,
         )
 
+    # Strategy entropy
     strategy_w = extra.get("strategy_w_raw", None)
     if strategy_w is not None:
         strat_ent = model.rnn.strategy_bank.entropy_loss(strategy_w)
         loss = loss - 0.03 * strat_ent
 
+    # Transition detector auxiliary loss
+    trans_prob = extra.get("trans_prob", None)
+    if trans_prob is not None:
+        trans_loss = model.rnn.transition_det.loss(trans_prob.mean(dim=1), trans_label)
+        loss = loss + 0.15 * trans_loss
+
+    # Homeostatic loss
+    if neuro_tensors:
+        nt = neuro_tensors
+        sht = nt.get("serotonin", None)
+        if sht is not None:
+            h_loss = model.rnn.homeostasis.homeostatic_loss(
+                da=nt["dopamine"], ne=nt["norepinephrine"], sht=sht
+            )
+            loss = loss + h_loss
+
+    # Hippocampal replay
     replay_buf.push(x, y, rpe=rpe_scalar)
     if replay_buf.should_replay(step):
         rx, ry = replay_buf.sample_rpe_biased(BATCH // 2)
         rx, ry = rx.to(device), ry.to(device)
         r_vol  = rx.std(dim=-1, keepdim=True)
-        rm, rs, re = model(rx, vol_indicator=r_vol)
+        rm, rs, re = model(rx, vol_indicator=r_vol, transition_label=0.0)
         loss   = loss + 0.3 * loss_fn((rm, rs), ry, re)
 
     loss.backward()
@@ -122,6 +151,7 @@ for step in range(TOTAL):
     optimizer.step()
     scheduler.step(step)
 
+    # Momentum decay on regime transition
     rw_delta = abs(rw - prev_rw)
     if rw_delta > 0.02:
         decay = max(0.1, 1.0 - rw_delta * 2)
@@ -137,8 +167,8 @@ for step in range(TOTAL):
         best_loss = lv
 
     if step % 50 == 0:
-        reg  = extra["regime_probs"].mean().item()
-        unc  = stds.mean().item()
+        reg   = extra["regime_probs"].mean().item()
+        unc   = stds.mean().item()
         neuro = extra.get("neuro", {})
         da    = neuro.get("dopamine", 0)
         ne    = neuro.get("norepinephrine", 0)
@@ -146,6 +176,9 @@ for step in range(TOTAL):
         sname = STRATEGY_NAMES[dom] if 0 <= dom < len(STRATEGY_NAMES) else "n/a"
         sw    = extra.get("strategy_weights", [])
         sw_str = "|".join(f"{v:.2f}" for v in sw) if sw else "n/a"
+        tp    = extra.get("trans_prob")
+        tp_v  = tp.mean().item() if tp is not None else 0.0
+        ce    = extra.get("cereb_err", 0.0)
         tag   = " <<< TRANSITION" if abs(rw - round(rw)) > 0.05 else ""
         print(
             f"Step {step:3d} [rw={rw:.2f}]"
@@ -154,6 +187,7 @@ for step in range(TOTAL):
             f" | Regime: {reg:.3f}"
             f" | Unc: {unc:.4f}"
             f" | DA={da:.2f} NE={ne:.2f}"
+            f" | Trans={tp_v:.2f} Cereb={ce:.3f}"
             f" | Strat={sname}[{sw_str}]"
             f"{tag}"
         )

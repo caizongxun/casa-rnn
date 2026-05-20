@@ -1,11 +1,14 @@
 """
 Bio-inspired neuromodulation modules for CASA-RNN.
 
-1. NeuromodulatorGating  - DA/ACh/NE/5HT with wide dynamic range
-2. ThalamicAttention     - top-down corticothalamic gate
-3. HippocampalReplayBuffer - RPE-biased sharp-wave replay
-4. PrefrontalWorkingMemory - orthogonal context/content + BG gate
-5. MetaLearningStrategyBank - internal learning strategy mixer with entropy regularization
+1. NeuromodulatorGating       - DA/ACh/NE/5HT with wide dynamic range
+2. ThalamicAttention          - top-down corticothalamic gate
+3. HippocampalReplayBuffer    - RPE-biased sharp-wave replay
+4. PrefrontalWorkingMemory    - orthogonal context/content + BG gate
+5. MetaLearningStrategyBank   - internal learning strategy mixer
+6. RegimeTransitionDetector   - auxiliary task: predict transition vs stable
+7. CerebellarForwardModel     - predict next hidden state (internal simulator)
+8. HomeostaticGainControl     - allostatic setpoint, prevent neuromod saturation
 """
 
 import torch
@@ -23,8 +26,7 @@ import random
 class NeuromodulatorGating(nn.Module):
     """
     context = [regime, log_vol, vol_of_vol] (size=3)
-    NE should correlate with vol_of_vol; DA should correlate with RPE.
-    The BioConstraintLoss in the training loop enforces these semantics.
+    Returns both detached scalars (for logging) and raw tensors (for bio loss).
     """
     def __init__(self, hidden_size: int, context_size: int = 3):
         super().__init__()
@@ -61,10 +63,10 @@ class NeuromodulatorGating(nn.Module):
 
         h = self.norm(h)
         return h, {
-            "dopamine":       da.detach(),
-            "acetylcholine":  ach.detach(),
-            "norepinephrine": ne.detach(),
-            "serotonin":      sht.detach(),
+            "dopamine":           da.detach(),
+            "acetylcholine":      ach.detach(),
+            "norepinephrine":     ne.detach(),
+            "serotonin":          sht.detach(),
             "dopamine_raw":       da,
             "acetylcholine_raw":  ach,
             "norepinephrine_raw": ne,
@@ -157,17 +159,6 @@ STRATEGY_NAMES = ["rehearsal", "chunking", "associative", "contrastive", "slow"]
 
 
 class MetaLearningStrategyBank(nn.Module):
-    """
-    Learns to mix 5 internal memory/learning strategies.
-    Entropy regularization prevents strategy collapse to one mode.
-
-    Strategies:
-      rehearsal    - reinforce/repeat existing representation
-      chunking     - compress via bottleneck then expand
-      associative  - bind to nonlinear transform of h
-      contrastive  - emphasize edges/deviations
-      slow         - blend toward low-frequency stable memory
-    """
     def __init__(self, hidden_size: int, context_size: int = 3, num_strategies: int = 5):
         super().__init__()
         self.num_strategies = num_strategies
@@ -210,11 +201,157 @@ class MetaLearningStrategyBank(nn.Module):
 
         w_mean = w.mean(dim=(0, 1))
         return out, {
-            "strategy_weights":   w_mean.detach().cpu(),
-            "dominant_strategy":  int(w_mean.argmax().item()),
-            "strategy_w_tensor":  w,
+            "strategy_weights":  w_mean.detach().cpu(),
+            "dominant_strategy": int(w_mean.argmax().item()),
+            "strategy_w_tensor": w,
         }
 
     def entropy_loss(self, w: torch.Tensor) -> torch.Tensor:
         w_mean = w.mean(dim=(0, 1)).clamp(min=1e-8)
         return -(w_mean * w_mean.log()).sum()
+
+
+# ---------------------------------------------------------------------------
+# 6. RegimeTransitionDetector
+# ---------------------------------------------------------------------------
+
+class RegimeTransitionDetector(nn.Module):
+    """
+    Auxiliary task: predict whether the current timestep is a regime transition.
+
+    Input: hidden state + recent delta_regime sequence
+    Output: transition_prob in [0,1]
+
+    Loss: BCE against an externally-provided transition label (0 or 1).
+    This gives the regime detector an explicit learning signal during
+    transitions, breaking the regime_scale low-certainty gradient trap.
+    """
+    def __init__(self, hidden_size: int, window: int = 8):
+        super().__init__()
+        self.window = window
+        self.encoder = nn.Sequential(
+            nn.Linear(hidden_size + window, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1),
+            nn.Sigmoid(),
+        )
+        self.register_buffer("delta_queue", torch.zeros(window))
+
+    def update_queue(self, regime_delta: float) -> None:
+        self.delta_queue = torch.roll(self.delta_queue, -1)
+        self.delta_queue[-1] = regime_delta
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        h: (B, 1, hidden_size) or (B, hidden_size)
+        returns transition_prob: (B, 1)
+        """
+        if h.dim() == 3:
+            h_flat = h.squeeze(1)
+        else:
+            h_flat = h
+        B = h_flat.shape[0]
+        delta_feat = self.delta_queue.unsqueeze(0).expand(B, -1).to(h_flat.device)
+        inp = torch.cat([h_flat, delta_feat], dim=-1)
+        return self.encoder(inp)
+
+    def loss(self, trans_prob: torch.Tensor, label: float) -> torch.Tensor:
+        target = torch.full_like(trans_prob, label)
+        return F.binary_cross_entropy(trans_prob, target)
+
+
+# ---------------------------------------------------------------------------
+# 7. CerebellarForwardModel
+# ---------------------------------------------------------------------------
+
+class CerebellarForwardModel(nn.Module):
+    """
+    Inspired by the cerebellum's role as an internal forward model:
+    given current hidden state + action (input), predict the next hidden state.
+
+    The prediction error (cerebellar error signal) acts as a refined RPE
+    that is more temporally precise than simple output error.
+    This error can modulate NE directly: surprise in internal model -> NE up.
+
+    Architecture: GRU-style update in a compact space.
+    """
+    def __init__(self, hidden_size: int, input_size: int, proj_size: int = 32):
+        super().__init__()
+        self.proj_size = proj_size
+        self.h_proj  = nn.Linear(hidden_size, proj_size)
+        self.x_proj  = nn.Linear(input_size,  proj_size)
+        self.predict = nn.Sequential(
+            nn.Linear(proj_size * 2, proj_size),
+            nn.Tanh(),
+            nn.Linear(proj_size, hidden_size),
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(
+        self,
+        h_now: torch.Tensor,    # (B, H)
+        x_now: torch.Tensor,    # (B, input_size)
+    ) -> torch.Tensor:
+        """Returns predicted next hidden state."""
+        hp = torch.tanh(self.h_proj(h_now))
+        xp = torch.tanh(self.x_proj(x_now))
+        return self.norm(self.predict(torch.cat([hp, xp], dim=-1)))
+
+    def cerebellar_error(
+        self,
+        h_pred: torch.Tensor,   # predicted h_next from forward model
+        h_next: torch.Tensor,   # actual h_next from RNN
+    ) -> torch.Tensor:
+        """L2 error between predicted and actual next state, shape (B, 1)."""
+        return (h_pred - h_next.detach()).pow(2).mean(dim=-1, keepdim=True)
+
+
+# ---------------------------------------------------------------------------
+# 8. HomeostaticGainControl
+# ---------------------------------------------------------------------------
+
+class HomeostaticGainControl(nn.Module):
+    """
+    Allostatic setpoint regulation for neuromodulators.
+
+    Problem: DA and NE can saturate (all values near 0.7+) which means
+    they lose their modulating power — no signal if everything is max.
+
+    Solution: track a running mean of each modulator; penalize deviation
+    from a biologically-plausible setpoint range. This is analogous to
+    how the brain maintains homeostasis via autoreceptors.
+
+    Setpoints (biologically motivated):
+      DA  ~ 0.55 (moderate baseline, spikes on reward)
+      NE  ~ 0.35 (low baseline, spikes on surprise)
+      5HT ~ 0.50 (neutral baseline, stable mood)
+    """
+    def __init__(self, da_set: float = 0.55, ne_set: float = 0.35, sht_set: float = 0.50,
+                 ema_alpha: float = 0.02, penalty_weight: float = 0.03):
+        super().__init__()
+        self.da_set  = da_set
+        self.ne_set  = ne_set
+        self.sht_set = sht_set
+        self.alpha   = ema_alpha
+        self.weight  = penalty_weight
+        self.register_buffer("da_ema",  torch.tensor(da_set))
+        self.register_buffer("ne_ema",  torch.tensor(ne_set))
+        self.register_buffer("sht_ema", torch.tensor(sht_set))
+
+    @torch.no_grad()
+    def update(self, da_mean: float, ne_mean: float, sht_mean: float) -> None:
+        self.da_ema  = (1 - self.alpha) * self.da_ema  + self.alpha * da_mean
+        self.ne_ema  = (1 - self.alpha) * self.ne_ema  + self.alpha * ne_mean
+        self.sht_ema = (1 - self.alpha) * self.sht_ema + self.alpha * sht_mean
+
+    def homeostatic_loss(
+        self,
+        da:  torch.Tensor,   # raw tensor with grad (B,T,1)
+        ne:  torch.Tensor,
+        sht: torch.Tensor,
+    ) -> torch.Tensor:
+        """Soft penalty pulling running mean toward setpoints."""
+        l_da  = (da.mean()  - self.da_set).pow(2)
+        l_ne  = (ne.mean()  - self.ne_set).pow(2)
+        l_sht = (sht.mean() - self.sht_set).pow(2)
+        return self.weight * (l_da + l_ne + l_sht)

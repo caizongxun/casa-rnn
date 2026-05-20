@@ -1,4 +1,4 @@
-"""Multi-Scale CASA-RNN: three parallel temporal paths fused with attention."""
+"""Multi-Scale CASA-RNN with full bio pipeline."""
 import torch
 import torch.nn as nn
 from typing import Optional, Dict
@@ -10,6 +10,9 @@ from .neuro_modules import (
     ThalamicAttention,
     PrefrontalWorkingMemory,
     MetaLearningStrategyBank,
+    RegimeTransitionDetector,
+    CerebellarForwardModel,
+    HomeostaticGainControl,
 )
 
 
@@ -29,6 +32,7 @@ class MultiScaleCASARNN(nn.Module):
     ):
         super().__init__()
         self.hidden_size            = hidden_size
+        self.input_size             = input_size
         self.use_memory             = use_memory
         self.use_bio                = use_bio
         self.regime_reset_threshold = regime_reset_threshold
@@ -45,10 +49,13 @@ class MultiScaleCASARNN(nn.Module):
         )
 
         if use_bio:
-            self.thal_attn     = ThalamicAttention(hidden_size, context_size)
-            self.neuro_gate    = NeuromodulatorGating(hidden_size, context_size)
-            self.pfc_wm        = PrefrontalWorkingMemory(hidden_size, context_dim=hidden_size // 4)
-            self.strategy_bank = MetaLearningStrategyBank(hidden_size, context_size, num_strategies=5)
+            self.thal_attn       = ThalamicAttention(hidden_size, context_size)
+            self.neuro_gate      = NeuromodulatorGating(hidden_size, context_size)
+            self.pfc_wm          = PrefrontalWorkingMemory(hidden_size, context_dim=hidden_size // 4)
+            self.strategy_bank   = MetaLearningStrategyBank(hidden_size, context_size, num_strategies=5)
+            self.transition_det  = RegimeTransitionDetector(hidden_size, window=8)
+            self.cerebellum      = CerebellarForwardModel(hidden_size, input_size, proj_size=hidden_size // 2)
+            self.homeostasis     = HomeostaticGainControl(da_set=0.55, ne_set=0.35, sht_set=0.50)
 
         if use_memory:
             self.memory = MemoryBank(hidden_size, num_slots=memory_slots, write_threshold=0.12)
@@ -71,6 +78,7 @@ class MultiScaleCASARNN(nn.Module):
         x: torch.Tensor,
         vol_indicator: Optional[torch.Tensor] = None,
         init_hidden: Optional[Dict] = None,
+        transition_label: float = 0.0,
     ):
         batch, seq_len, _ = x.shape
         device = x.device
@@ -79,11 +87,16 @@ class MultiScaleCASARNN(nn.Module):
         means, stds = [], []
         all_regime, all_scale_weights = [], []
         all_neuro_scalar = {"dopamine": [], "acetylcholine": [], "norepinephrine": [], "serotonin": []}
-        all_da, all_ne, all_vov, all_rpe_t = [], [], [], []
+        all_da, all_ne, all_sht = [], [], []
+        all_vov, all_rpe_t = [], []
         all_strategy_w = []
+        all_trans_prob = []
+        all_cereb_err  = []
         total_pred_err = torch.zeros(1, device=device)
 
         prev_log_vol = None
+        prev_fused   = None
+
         for t in range(seq_len):
             xt = x[:, t, :]
             vt = vol_indicator[:, t, :] if vol_indicator is not None else None
@@ -122,14 +135,37 @@ class MultiScaleCASARNN(nn.Module):
                     vov = (log_vol - prev_log_vol).abs()
                 prev_log_vol = log_vol.detach()
 
-                ctx = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)
-                h_t = fused.unsqueeze(1)
+                # update transition detector delta queue
+                self.transition_det.update_queue(delta)
+
+                ctx   = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)
+                h_t   = fused.unsqueeze(1)
                 rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)
+
+                # --- Cerebellar forward model: predict current fused from prev ---
+                if prev_fused is not None:
+                    h_pred_cereb = self.cerebellum(prev_fused, xt)
+                    cereb_err    = self.cerebellum.cerebellar_error(h_pred_cereb, fused)
+                    # cerebellar error refines RPE: more precise surprise signal
+                    rpe_t = rpe_t + 0.3 * cereb_err.unsqueeze(1)
+                    all_cereb_err.append(cereb_err.detach().mean().item())
+                prev_fused = fused.detach()
 
                 h_t = self.thal_attn(h_t, ctx)
                 h_t, neuro_d = self.neuro_gate(h_t, ctx)
                 h_t = self.pfc_wm(h_t, rpe=rpe_t)
                 h_t, strategy_info = self.strategy_bank(h_t, ctx, rpe_t)
+
+                # --- Transition detector ---
+                trans_prob = self.transition_det(h_t)
+                all_trans_prob.append(trans_prob)
+
+                # --- Homeostasis EMA update (no grad) ---
+                self.homeostasis.update(
+                    da_mean=neuro_d["dopamine"].mean().item(),
+                    ne_mean=neuro_d["norepinephrine"].mean().item(),
+                    sht_mean=neuro_d["serotonin"].mean().item(),
+                )
 
                 fused = h_t.squeeze(1)
 
@@ -140,6 +176,7 @@ class MultiScaleCASARNN(nn.Module):
 
                 all_da.append(neuro_d["dopamine_raw"])
                 all_ne.append(neuro_d["norepinephrine_raw"])
+                all_sht.append(neuro_d["serotonin_raw"])
                 all_vov.append(vov.unsqueeze(1))
                 all_rpe_t.append(rpe_t)
                 all_strategy_w.append(strategy_info["strategy_w_tensor"])
@@ -167,29 +204,36 @@ class MultiScaleCASARNN(nn.Module):
             neuro_tensors = {
                 "dopamine":       torch.cat(all_da,  dim=1),
                 "norepinephrine": torch.cat(all_ne,  dim=1),
+                "serotonin":      torch.cat(all_sht, dim=1),
             }
-            vov_full  = torch.cat(all_vov,   dim=1)
-            rpe_full  = torch.cat(all_rpe_t, dim=1)
-            strat_raw = torch.cat(all_strategy_w, dim=1)
-            sw_mean   = strat_raw.mean(dim=(0, 1)).detach().cpu().tolist()
-            dom       = int(strat_raw.mean(dim=(0, 1)).argmax().item())
+            vov_full    = torch.cat(all_vov,       dim=1)
+            rpe_full    = torch.cat(all_rpe_t,     dim=1)
+            strat_raw   = torch.cat(all_strategy_w, dim=1)
+            trans_stack = torch.cat(all_trans_prob, dim=1) if all_trans_prob else None
+            sw_mean     = strat_raw.mean(dim=(0, 1)).detach().cpu().tolist()
+            dom         = int(strat_raw.mean(dim=(0, 1)).argmax().item())
+            avg_cereb   = sum(all_cereb_err) / len(all_cereb_err) if all_cereb_err else 0.0
         else:
             neuro_tensors = {}
-            vov_full = rpe_full = strat_raw = None
+            vov_full = rpe_full = strat_raw = trans_stack = None
             sw_mean  = []
             dom      = -1
+            avg_cereb = 0.0
 
         extra = {
-            "pred_coding_loss": total_pred_err / (seq_len * 3),
-            "regime_probs":     regime,
-            "scale_weights":    scale_w,
-            "final_hidden":     hidden,
-            "neuro":            neuro_summary,
-            "neuro_tensors":    neuro_tensors,
-            "vol_of_vol":       vov_full,
-            "rpe_tensor":       rpe_full,
-            "strategy_w_raw":   strat_raw,
-            "strategy_weights": sw_mean,
+            "pred_coding_loss":  total_pred_err / (seq_len * 3),
+            "regime_probs":      regime,
+            "scale_weights":     scale_w,
+            "final_hidden":      hidden,
+            "neuro":             neuro_summary,
+            "neuro_tensors":     neuro_tensors,
+            "vol_of_vol":        vov_full,
+            "rpe_tensor":        rpe_full,
+            "strategy_w_raw":    strat_raw,
+            "strategy_weights":  sw_mean,
             "dominant_strategy": dom,
+            "trans_prob":        trans_stack,
+            "cereb_err":         avg_cereb,
+            "transition_label":  transition_label,
         }
         return means, stds, extra
