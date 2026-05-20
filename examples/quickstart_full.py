@@ -1,16 +1,12 @@
 """
 Full CASA-RNN quickstart — all modules active, SoftModuleRouter governs tradeoffs.
 
-Routing entropy schedule:
-  Phase 1 (0..WARMUP):    high entropy weight -> explore all modules uniformly
-  Phase 2 (WARMUP..END):  low entropy weight  -> router sharpens toward specialists
-
-CPG period regulariser: keeps oscillators spread apart.
-Conformal calibration: after training, run on held-out slice for guaranteed intervals.
-
 Changelog:
-  - Router sparsity loss weight: 0.005 -> 0.02  (stronger specialisation pressure)
-  - Danger EMA alpha: 0.01 -> 0.05              (see danger.py)
+  - Router sparsity loss weight: 0.005 -> 0.02
+  - Danger EMA alpha: 0.01 -> 0.05
+  - Direction A: regime_consistency_loss added to training loop
+  - Direction B: selective_reset integrated in multiscale.py (no change needed here)
+  - Direction C: contrastive_loss added to training loop
 """
 import torch
 import torch.optim as optim
@@ -28,7 +24,7 @@ FEAT   = 16
 TOTAL  = 800
 SWITCH = [200, 500]
 TRANS  = 30
-WARMUP = 200         # router entropy warmup
+WARMUP = 200
 ENT_HIGH, ENT_LOW = 0.15, 0.01
 
 
@@ -47,7 +43,6 @@ def is_transition(step, hw=25):
 def router_ent_weight(step):
     if step >= WARMUP:
         return ENT_LOW
-    # cosine warmup: high -> low
     ratio = step / WARMUP
     return ENT_LOW + (ENT_HIGH - ENT_LOW) * 0.5 * (1 + math.cos(math.pi * ratio))
 
@@ -77,7 +72,7 @@ model = CASARNNModel(
 replay_buf  = HippocampalReplayBuffer(capacity=300, replay_every=25)
 bio_loss_fn = BioConstraintLoss(ne_weight=0.05, da_weight=0.05)
 
-alpha_params = [model.genome.soft_op.alpha]
+alpha_params  = [model.genome.soft_op.alpha]
 router_params = list(model.rnn.router.parameters())
 other_params  = [
     p for n, p in model.named_parameters()
@@ -110,10 +105,8 @@ for step in range(TOTAL):
     task_loss = loss_fn((means, stds), y, extra)
     loss      = task_loss
 
-    # CPG period spread regulariser
     loss = loss + 0.005 * model.rnn.cpg.period_loss()
 
-    # Bio constraints
     nt  = extra.get("neuro_tensors", {})
     vov = extra.get("vol_of_vol", None)
     rpe = extra.get("rpe_tensor",  None)
@@ -121,17 +114,14 @@ for step in range(TOTAL):
         loss = loss + bio_loss_fn(ne=nt["norepinephrine"], vol_of_vol=vov,
                                   da=nt["dopamine"],        rpe=rpe)
 
-    # Strategy entropy
     sw = extra.get("strategy_w_raw", None)
     if sw is not None:
         loss = loss - 0.03 * model.rnn.strategy_bank.entropy_loss(sw)
 
-    # Transition detector aux loss
     tp = extra.get("trans_prob", None)
     if tp is not None:
         loss = loss + 0.15 * model.rnn.transition_det.loss(tp.mean(dim=1), tl)
 
-    # Homeostatic loss
     if nt:
         sht = nt.get("serotonin", None)
         if sht is not None:
@@ -139,19 +129,25 @@ for step in range(TOTAL):
                 da=nt["dopamine"], ne=nt["norepinephrine"], sht=sht
             )
 
-    # SoftModuleRouter: entropy warmup -> sparsity
-    # sparsity weight increased 0.005 -> 0.02 for stronger specialisation
+    # Router: entropy warmup -> sparsity + regime consistency (Direction A)
     rw_full = extra.get("router_weights", None)
     if rw_full is not None:
         if step < WARMUP:
             loss = loss - rew * model.rnn.router.entropy_loss(rw_full)
         else:
             loss = loss + 0.02 * model.rnn.router.sparsity_loss(rw_full)
+            # Direction A: regime consistency loss (active after warmup)
+            rc_loss = extra.get("regime_consistency_loss", None)
+            if rc_loss is not None:
+                loss = loss + 0.01 * rc_loss
 
-    # Conformal sharpness incentive
+    # Direction C: contrastive state regularizer
+    ct_loss = extra.get("contrastive_loss", None)
+    if ct_loss is not None:
+        loss = loss + 0.02 * ct_loss
+
     loss = loss + 0.002 * model.conformal.sharpness_loss(stds)
 
-    # Hippocampal replay
     replay_buf.push(x, y, rpe=rpe_scalar)
     if replay_buf.should_replay(step):
         rx, ry = replay_buf.sample_rpe_biased(BATCH // 2)
@@ -166,7 +162,6 @@ for step in range(TOTAL):
     optimizer.step()
     scheduler.step(step)
 
-    # Momentum decay on regime transition
     rw_delta = abs(rw - prev_rw)
     if rw_delta > 0.02:
         decay = max(0.1, 1.0 - rw_delta * 2)
@@ -196,6 +191,10 @@ for step in range(TOTAL):
         a_alp = extra.get("astrocyte_alpha", 0.0)
         r_tmp = extra.get("router_temperature", 0.0)
         rwm   = extra.get("router_w_mean", [])
+        rc    = extra.get("regime_consistency_loss")
+        rc_v  = rc.item() if rc is not None and hasattr(rc, 'item') else 0.0
+        ct    = extra.get("contrastive_loss")
+        ct_v  = ct.item() if ct is not None and hasattr(ct, 'item') else 0.0
         if rwm:
             top2 = sorted(enumerate(rwm), key=lambda kv: -kv[1])[:2]
             top2_str = "+".join(MODULE_NAMES[i] for i, _ in top2)
@@ -207,6 +206,7 @@ for step in range(TOTAL):
             f" | Reg={reg:.3f} DA={da:.2f} NE={ne:.2f}"
             f" | Trans={tp_v:.2f} Cereb={ce:.3f} Danger={ds:.3f}"
             f" | Router: T={r_tmp:.2f} top={top2_str}"
+            f" | RC={rc_v:.3f} CT={ct_v:.3f}"
             f" | Astro: a={a_alp:.3f}"
             f" | CPG: {[f'{p:.0f}' for p in cpg_p]}"
             f" | Strat={sname}"

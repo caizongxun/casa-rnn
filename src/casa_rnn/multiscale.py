@@ -1,16 +1,11 @@
 """
 Multi-Scale CASA-RNN — full bio + topology pipeline.
 
-Module routing:
-  SoftModuleRouter decides per-timestep which optional modules to activate.
-  Weight is a soft blend: h_out = sum_i w_i * h_i + (1-sum) * h_passthrough
-
-Adaptive stride:
-  Controlled by DangerSignalDetector.
-  High danger -> stride shrinks (finer resolution).
-  Low danger  -> stride expands (coarser, faster).
-  NOTE: stride here controls how many timesteps the SLOW cell updates
-        (fast cell always runs every step).
+Changelog:
+  - Integrated DangerSignalDetector.selective_reset() on h_slow (Direction B)
+  - SoftModuleRouter.regime_consistency_loss() added to extra dict for
+    optional use in training loop (Direction A)
+  - ContrastiveStateRegularizer added, hidden states collected for Direction C
 """
 import torch
 import torch.nn as nn
@@ -22,6 +17,7 @@ from .neuro_modules import (
     NeuromodulatorGating, ThalamicAttention, PrefrontalWorkingMemory,
     MetaLearningStrategyBank, RegimeTransitionDetector,
     CerebellarForwardModel, HomeostaticGainControl, SoftModuleRouter,
+    ContrastiveStateRegularizer,
     MODULE_NAMES,
 )
 from .cpg import CPGEncoder
@@ -54,10 +50,9 @@ class MultiScaleCASARNN(nn.Module):
         self.hidden_decay_rate      = hidden_decay_rate
         self.input_size             = input_size
 
-        # CPG adds extra input channels
         from .cpg import CPGEncoder
         self.cpg         = CPGEncoder(cpg_periods)
-        cpg_dim          = self.cpg.out_dim  # 2 * num_oscillators
+        cpg_dim          = self.cpg.out_dim
         rnn_input_size   = input_size + cpg_dim
 
         self.cell_fast = CASARNNCell(rnn_input_size, hidden_size, dropout=dropout)
@@ -82,6 +77,7 @@ class MultiScaleCASARNN(nn.Module):
             self.tda            = TDAFeatureExtractor(input_size, window=tda_window)
             self.tda_proj       = nn.Linear(3, hidden_size)
             self.router         = SoftModuleRouter(hidden_size, num_modules=len(MODULE_NAMES))
+            self.contrastive_reg = ContrastiveStateRegularizer(temperature=0.5)
 
         if use_memory:
             self.memory = MemoryBank(hidden_size, num_slots=memory_slots, write_threshold=0.12)
@@ -101,28 +97,24 @@ class MultiScaleCASARNN(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                            # (B, T, input_size)
+        x: torch.Tensor,
         vol_indicator: Optional[torch.Tensor] = None,
         init_hidden: Optional[Dict] = None,
         transition_label: float = 0.0,
-        t_offset: int = 0,                          # for CPG phase continuity
-        router_entropy_weight: float = 0.02,        # annealed externally
+        t_offset: int = 0,
+        router_entropy_weight: float = 0.02,
     ):
         batch, seq_len, raw_feat = x.shape
         device = x.device
         hidden = init_hidden if init_hidden is not None else self._init_hidden(batch, device)
 
-        # CPG features for the whole sequence at once
-        cpg_feats = self.cpg(seq_len, batch, device, t_offset=t_offset)  # (B, T, cpg_dim)
-        # Augment input
-        x_aug = torch.cat([x, cpg_feats], dim=-1)  # (B, T, input_size+cpg_dim)
+        cpg_feats = self.cpg(seq_len, batch, device, t_offset=t_offset)
+        x_aug     = torch.cat([x, cpg_feats], dim=-1)
 
-        # TDA features: compute once per forward call over the full window
-        tda_window = min(seq_len, self.tda.window)
-        tda_feats_seq = self.tda(x[:, :tda_window, :])   # (B, 3)
-        tda_h_base    = self.tda_proj(tda_feats_seq)      # (B, hidden_size)
+        tda_window    = min(seq_len, self.tda.window)
+        tda_feats_seq = self.tda(x[:, :tda_window, :])
+        tda_h_base    = self.tda_proj(tda_feats_seq)
 
-        # Reset astrocyte state for new batch
         if self.use_bio:
             self.astrocyte.reset(batch, device)
 
@@ -135,23 +127,22 @@ class MultiScaleCASARNN(nn.Module):
         all_cereb_err   = []
         all_router_w    = []
         all_danger      = []
+        all_fused       = []   # collected for contrastive loss
+        all_regime_t    = []   # collected for contrastive loss
         total_pred_err  = torch.zeros(1, device=device)
 
         prev_log_vol = None
         prev_fused   = None
-        prev_x_t     = None
 
-        # Adaptive stride state
         slow_step_counter = 0
-        slow_update_every = 1  # dynamically adjusted per timestep
+        slow_update_every = 1
 
         for t in range(seq_len):
-            xt     = x[:, t, :]        # (B, raw_feat)
-            xt_aug = x_aug[:, t, :]    # (B, input_size+cpg_dim)
+            xt     = x[:, t, :]
+            xt_aug = x_aug[:, t, :]
             vt     = vol_indicator[:, t, :] if vol_indicator is not None else None
 
             hs_f, hf_f, reg_f, pe_f = self.cell_fast(xt_aug, *hidden['fast'], vt)
-            # Adaptive stride: slow cell updates only every slow_update_every steps
             slow_step_counter += 1
             if slow_step_counter >= slow_update_every:
                 hs_m, hf_m, reg_m, pe_m = self.cell_mid (xt_aug, *hidden['mid'],  vt)
@@ -169,6 +160,8 @@ class MultiScaleCASARNN(nn.Module):
             if delta > self.regime_reset_threshold:
                 hf_f = self._soft_decay(hf_f, delta)
                 hf_m = self._soft_decay(hf_m, delta)
+                # Direction B: selective reset on h_slow via DangerSignalDetector
+                # (applied below after danger score is computed)
 
             hidden['fast'] = (hs_f, hf_f)
             hidden['mid']  = (hs_m, hf_m)
@@ -184,7 +177,7 @@ class MultiScaleCASARNN(nn.Module):
             danger_score = torch.zeros(batch, 1, device=device)
 
             if self.use_bio:
-                regime_t = regime_mean.unsqueeze(-1)  # (B,1)
+                regime_t = regime_mean.unsqueeze(-1)
                 vol_t    = vt if vt is not None else torch.zeros_like(regime_t)
                 log_vol  = torch.log1p(vol_t.abs())
                 if prev_log_vol is None:
@@ -193,35 +186,32 @@ class MultiScaleCASARNN(nn.Module):
                     vov = (log_vol - prev_log_vol).abs()
                 prev_log_vol = log_vol.detach()
 
-                # Danger signal
                 self.danger_det.update(fused)
-                danger_score = self.danger_det(fused)  # (B,1)
+                danger_score = self.danger_det(fused)
 
-                # Adaptive stride: high danger -> run slow cells every step
+                # Direction B: selective state reset on h_slow
+                # Only apply when regime is actually shifting (delta > threshold)
+                if delta > self.regime_reset_threshold:
+                    hs_s_reset = self.danger_det.selective_reset(hidden['slow'][0], danger_score)
+                    hf_s_reset = self.danger_det.selective_reset(hidden['slow'][1], danger_score)
+                    hidden['slow'] = (hs_s_reset, hf_s_reset)
+
                 mean_danger = danger_score.mean().item()
                 slow_update_every = max(1, int(3.0 / (1.0 + 3.0 * mean_danger)))
 
-                # TDA injection: add topology features to fused state
                 fused = fused + 0.1 * tda_h_base
 
-                # SoftModuleRouter: decide which modules matter this timestep
                 router_weights = self.router(
-                    h=fused,
-                    regime=regime_t,
-                    danger=danger_score,
-                    vov=vov,
-                )  # (B, num_modules)
+                    h=fused, regime=regime_t, danger=danger_score, vov=vov,
+                )
                 all_router_w.append(router_weights)
 
-                # Module indices per MODULE_NAMES order:
-                # ["thalamic","neuromod","pfc_wm","strategy","transition","cerebellum","astrocyte","danger","tda","cpg"]
-                w = router_weights  # (B, 10)
+                w = router_weights
 
-                ctx  = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)  # (B,1,3)
-                h_t  = fused.unsqueeze(1)                                         # (B,1,H)
+                ctx   = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)
+                h_t   = fused.unsqueeze(1)
                 rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)
 
-                # Cerebellar error -> refines RPE
                 cereb_err_val = 0.0
                 if prev_fused is not None:
                     h_pred_cereb = self.cerebellum(prev_fused, xt_aug)
@@ -232,49 +222,39 @@ class MultiScaleCASARNN(nn.Module):
                     all_cereb_err.append(cereb_err_val)
                 prev_fused = fused.detach()
 
-                # TransitionDetector update
                 self.transition_det.update_queue(delta)
 
-                # Thalamic attention (gated by router)
                 h_thal = self.thal_attn(h_t, ctx)
                 w_thal = w[:, MODULE_NAMES.index("thalamic")].unsqueeze(-1).unsqueeze(-1)
                 h_t    = (1 - w_thal) * h_t + w_thal * h_thal
 
-                # Neuromodulator gating
                 h_neuro, neuro_d = self.neuro_gate(h_t, ctx)
                 w_neuro = w[:, MODULE_NAMES.index("neuromod")].unsqueeze(-1).unsqueeze(-1)
                 h_t     = (1 - w_neuro) * h_t + w_neuro * h_neuro
 
-                # Danger -> NE boost
-                ne_boosted = self.danger_det.ne_boost(danger_score, neuro_d["norepinephrine_raw"].squeeze(1))
-                w_danger   = w[:, MODULE_NAMES.index("danger")].unsqueeze(-1)
+                ne_boosted   = self.danger_det.ne_boost(danger_score, neuro_d["norepinephrine_raw"].squeeze(1))
+                w_danger     = w[:, MODULE_NAMES.index("danger")].unsqueeze(-1)
                 ne_effective = (1 - w_danger) * neuro_d["norepinephrine_raw"].squeeze(1) + w_danger * ne_boosted
 
-                # Astrocyte modulation
                 h_ast  = self.astrocyte(h_t.squeeze(1)).unsqueeze(1)
                 w_ast  = w[:, MODULE_NAMES.index("astrocyte")].unsqueeze(-1).unsqueeze(-1)
                 h_t    = (1 - w_ast) * h_t + w_ast * h_ast
 
-                # PFC working memory
                 h_pfc  = self.pfc_wm(h_t, rpe=rpe_t)
                 w_pfc  = w[:, MODULE_NAMES.index("pfc_wm")].unsqueeze(-1).unsqueeze(-1)
                 h_t    = (1 - w_pfc) * h_t + w_pfc * h_pfc
 
-                # Strategy bank
                 h_strat, strategy_info = self.strategy_bank(h_t, ctx, rpe_t)
                 w_strat = w[:, MODULE_NAMES.index("strategy")].unsqueeze(-1).unsqueeze(-1)
                 h_t     = (1 - w_strat) * h_t + w_strat * h_strat
 
-                # Transition detector
                 trans_prob = self.transition_det(h_t)
                 all_trans_prob.append(trans_prob)
 
-                # TDA: inject topology awareness (already added as tda_h_base above)
                 w_tda  = w[:, MODULE_NAMES.index("tda")].unsqueeze(-1)
                 fused  = h_t.squeeze(1) + w_tda * tda_h_base * 0.1
                 h_t    = fused.unsqueeze(1)
 
-                # Homeostasis update
                 self.homeostasis.update(
                     da_mean=neuro_d["dopamine"].mean().item(),
                     ne_mean=ne_effective.mean().item(),
@@ -282,6 +262,10 @@ class MultiScaleCASARNN(nn.Module):
                 )
 
                 fused = h_t.squeeze(1)
+
+                # Collect hidden states for contrastive loss
+                all_fused.append(fused.unsqueeze(1))
+                all_regime_t.append(regime_t.unsqueeze(1))
 
                 for k in all_neuro_scalar:
                     all_neuro_scalar[k].append(neuro_d[k].mean().item())
@@ -312,13 +296,25 @@ class MultiScaleCASARNN(nn.Module):
 
         neuro_summary = {k: (sum(v) / len(v) if v else 0.0) for k, v in all_neuro_scalar.items()}
 
-        # Router stats
         if all_router_w:
-            router_w_full = torch.stack(all_router_w, dim=1)  # (B, T, num_modules)
+            router_w_full = torch.stack(all_router_w, dim=1)
             router_w_mean = router_w_full.mean(dim=(0, 1)).detach().cpu().tolist()
         else:
             router_w_full = None
             router_w_mean = []
+
+        # Compute regime_consistency_loss for optional use in training loop
+        regime_consist_loss = torch.tensor(0.0, device=device)
+        if self.use_bio and router_w_full is not None and all_regime_t:
+            regime_cat = torch.cat(all_regime_t, dim=1)  # (B, T, 1)
+            regime_consist_loss = self.router.regime_consistency_loss(router_w_full, regime_cat)
+
+        # Contrastive state regularizer loss
+        contrastive_loss = torch.tensor(0.0, device=device)
+        if self.use_bio and all_fused and all_regime_t:
+            fused_cat  = torch.cat(all_fused, dim=1)    # (B, T, H)
+            regime_cat = torch.cat(all_regime_t, dim=1) # (B, T, 1)
+            contrastive_loss = self.contrastive_reg(fused_cat, regime_cat)
 
         if self.use_bio and all_da:
             neuro_tensors = {
@@ -340,26 +336,29 @@ class MultiScaleCASARNN(nn.Module):
             sw_mean  = []; dom = -1; avg_cereb = 0.0; danger_full = 0.0
 
         extra = {
-            "pred_coding_loss":  total_pred_err / (seq_len * 3),
-            "regime_probs":      regime,
-            "scale_weights":     scale_w,
-            "final_hidden":      hidden,
-            "neuro":             neuro_summary,
-            "neuro_tensors":     neuro_tensors,
-            "vol_of_vol":        vov_full,
-            "rpe_tensor":        rpe_full,
-            "strategy_w_raw":    strat_raw,
-            "strategy_weights":  sw_mean,
-            "dominant_strategy": dom,
-            "trans_prob":        trans_stack,
-            "cereb_err":         avg_cereb,
-            "transition_label":  transition_label,
-            "router_weights":    router_w_full,
-            "router_w_mean":     router_w_mean,
-            "danger_score":      danger_full,
-            "cpg_periods":       [o.period.item() for o in self.cpg.oscillators],
-            "astrocyte_alpha":   self.astrocyte.alpha.item() if self.use_bio else None,
-            "astrocyte_beta":    self.astrocyte.beta.item()  if self.use_bio else None,
-            "router_temperature": self.router.temperature.item() if self.use_bio else None,
+            "pred_coding_loss":       total_pred_err / (seq_len * 3),
+            "regime_probs":           regime,
+            "scale_weights":          scale_w,
+            "final_hidden":           hidden,
+            "neuro":                  neuro_summary,
+            "neuro_tensors":          neuro_tensors,
+            "vol_of_vol":             vov_full,
+            "rpe_tensor":             rpe_full,
+            "strategy_w_raw":         strat_raw,
+            "strategy_weights":       sw_mean,
+            "dominant_strategy":      dom,
+            "trans_prob":             trans_stack,
+            "cereb_err":              avg_cereb,
+            "transition_label":       transition_label,
+            "router_weights":         router_w_full,
+            "router_w_mean":          router_w_mean,
+            "danger_score":           danger_full,
+            "cpg_periods":            [o.period.item() for o in self.cpg.oscillators],
+            "astrocyte_alpha":        self.astrocyte.alpha.item() if self.use_bio else None,
+            "astrocyte_beta":         self.astrocyte.beta.item()  if self.use_bio else None,
+            "router_temperature":     self.router.temperature.item() if self.use_bio else None,
+            # New: auxiliary losses exposed for optional use in training loop
+            "regime_consistency_loss": regime_consist_loss,
+            "contrastive_loss":        contrastive_loss,
         }
         return means, stds, extra
