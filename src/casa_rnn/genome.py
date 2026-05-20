@@ -31,11 +31,26 @@ def _momentum(x: torch.Tensor, lag: int = 5) -> torch.Tensor:
     return x - x.roll(lag, dims=1)
 
 
+def _soft_sign(x: torch.Tensor) -> torch.Tensor:
+    """Differentiable approximation of sign: tanh(10x)."""
+    return torch.tanh(x * 10.0)
+
+
 # ---------------------------------------------------------------------------
 # 1. SoftOpBank  (DARTS-style continuous relaxation)
 # ---------------------------------------------------------------------------
 
 class SoftOpBank(nn.Module):
+    """
+    Gradient flow fixes:
+    1. Removed torch.sign (zero gradient everywhere) -> replaced with soft_sign
+    2. Removed LayerNorm before output: LN normalises activations uniformly,
+       making alpha gradients near-zero (all outputs look the same to alpha).
+       Instead: use a learnable scale (gain) per feature so alpha can still
+       control the magnitude after the weighted sum.
+    3. Auxiliary entropy loss (called from outside) pushes alpha to sharpen.
+    """
+
     OPS = [
         ("identity",  lambda x: x),
         ("lag1",      lambda x: x.roll(1, dims=1)),
@@ -44,7 +59,7 @@ class SoftOpBank(nn.Module):
         ("diff1",     lambda x: x - x.roll(1, dims=1)),
         ("diff5",     lambda x: _momentum(x, 5)),
         ("log",       _safe_log),
-        ("sign",      torch.sign),
+        ("soft_sign", _soft_sign),           # replaces torch.sign (zero grad)
         ("square",    lambda x: x ** 2),
         ("ma5",       lambda x: _rolling_mean(x, 5)),
         ("ma20",      lambda x: _rolling_mean(x, 20)),
@@ -59,21 +74,44 @@ class SoftOpBank(nn.Module):
 
     def __init__(self, raw_size: int, feat_size: int):
         super().__init__()
-        # Random init: break symmetry so different features explore different ops
-        self.alpha = nn.Parameter(
-            torch.randn(feat_size, raw_size, self.N_OPS) * 0.5
-        )
-        self.norm      = nn.LayerNorm(feat_size)
         self.raw_size  = raw_size
         self.feat_size = feat_size
-        # Learnable output mix: raw_size ops -> feat_size
-        self.out_mix = nn.Linear(raw_size, feat_size, bias=False)
+
+        # alpha: gating weights — random init breaks symmetry
+        # Use larger scale (1.0) so softmax starts less uniform
+        self.alpha = nn.Parameter(
+            torch.randn(feat_size, raw_size, self.N_OPS) * 1.0
+        )
+
+        # Learnable per-feature gain + bias AFTER weighted sum
+        # This replaces LayerNorm: allows alpha to see output magnitude differences
+        self.gain = nn.Parameter(torch.ones(feat_size))
+        self.bias = nn.Parameter(torch.zeros(feat_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, D_raw) -> (B, T, feat_size)"""
         ops_out = torch.stack([op(x) for _, op in self.OPS], dim=-1)  # (B,T,D,N_OPS)
-        w = F.softmax(self.alpha, dim=-1)                              # (feat,raw,N_OPS)
-        z = torch.einsum('btdo,fdo->btf', ops_out, w)                 # (B,T,feat)
-        return self.norm(z)
+
+        # Clamp ops output to prevent numerical explosion (esp. square, log)
+        ops_out = ops_out.clamp(-10.0, 10.0)
+
+        w = F.softmax(self.alpha, dim=-1)           # (feat, raw, N_OPS)
+        z = torch.einsum('btdo,fdo->btf', ops_out, w)  # (B, T, feat)
+
+        # Affine rescale (no normalisation that kills alpha gradient)
+        return z * self.gain + self.bias
+
+    def alpha_entropy_loss(self) -> torch.Tensor:
+        """
+        Auxiliary loss to encourage alpha to sharpen (low entropy).
+        Added to the main loss with a small weight (e.g. 0.01).
+        This directly creates gradient pressure on alpha.
+        Without this, alpha only gets gradient from the task loss,
+        which is often too weak after passing through many layers.
+        """
+        w   = F.softmax(self.alpha, dim=-1)          # (feat, raw, N_OPS)
+        ent = -(w * (w + 1e-8).log()).sum(-1).mean()  # scalar
+        return ent
 
     def get_dominant_ops(self) -> dict:
         w        = F.softmax(self.alpha.detach(), dim=-1)
@@ -86,47 +124,35 @@ class SoftOpBank(nn.Module):
         return result
 
     def get_op_entropy(self) -> float:
-        """Low entropy = ops have converged to sharp choices. High = still exploring."""
-        w = F.softmax(self.alpha.detach(), dim=-1)
+        w   = F.softmax(self.alpha.detach(), dim=-1)
         ent = -(w * (w + 1e-8).log()).sum(-1).mean()
         return ent.item()
 
 
 # ---------------------------------------------------------------------------
-# 2. CrossFeatureInteraction  (learned sparse interaction matrix)
+# 2. CrossFeatureInteraction
 # ---------------------------------------------------------------------------
 
 class CrossFeatureInteraction(nn.Module):
-    """
-    Learns multiplicative interactions between feature pairs.
-    interact_w is initialized with random noise so different pairs
-    start with different weights -> gradient can differentiate them.
-    """
-
     def __init__(self, feat_size: int, top_k: int = 8):
         super().__init__()
         self.feat_size = feat_size
         self.top_k     = top_k
-        # KEY FIX: random init instead of zeros
-        # zeros -> sigmoid(0)=0.5 everywhere -> all pairs identical -> no gradient signal
-        # random -> different starting weights -> gradient can select winners
-        self.interact_w = nn.Parameter(
-            torch.randn(feat_size, feat_size) * 0.3
-        )
-        self.out_proj = nn.Linear(feat_size + top_k, feat_size)
-        self.norm     = nn.LayerNorm(feat_size)
+        self.interact_w = nn.Parameter(torch.randn(feat_size, feat_size) * 0.3)
+        self.out_proj   = nn.Linear(feat_size + top_k, feat_size)
+        self.norm       = nn.LayerNorm(feat_size)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         B, T, D = z.shape
-        mask    = torch.sigmoid(self.interact_w)
-        eye     = torch.eye(D, device=z.device)
-        mask    = mask * (1 - eye)           # zero diagonal (no self-interact)
-        mask    = (mask + mask.T) / 2        # symmetry
+        mask = torch.sigmoid(self.interact_w)
+        eye  = torch.eye(D, device=z.device)
+        mask = mask * (1 - eye)
+        mask = (mask + mask.T) / 2
 
-        flat            = mask.reshape(-1)
+        flat = mask.reshape(-1)
         topk_vals, topk_idx = flat.topk(self.top_k)
-        row_idx         = topk_idx // D
-        col_idx         = topk_idx % D
+        row_idx = topk_idx // D
+        col_idx = topk_idx % D
 
         interact_terms = []
         for k in range(self.top_k):
@@ -135,35 +161,34 @@ class CrossFeatureInteraction(nn.Module):
             term = z[:, :, i] * z[:, :, j] * topk_vals[k]
             interact_terms.append(term.unsqueeze(-1))
 
-        interact_out = torch.cat(interact_terms, dim=-1)     # (B,T,top_k)
-        combined     = torch.cat([z, interact_out], dim=-1)  # (B,T,D+top_k)
+        interact_out = torch.cat(interact_terms, dim=-1)
+        combined     = torch.cat([z, interact_out], dim=-1)
         return self.norm(self.out_proj(combined))
 
     def get_top_interactions(self) -> list:
-        mask            = torch.sigmoid(self.interact_w.detach())
-        flat            = mask.reshape(-1)
-        _, topk_idx     = flat.topk(self.top_k)
-        pairs = []
-        for idx in topk_idx:
+        mask    = torch.sigmoid(self.interact_w.detach())
+        flat    = mask.reshape(-1)
+        _, topk = flat.topk(self.top_k)
+        pairs   = []
+        for idx in topk:
             i = idx.item() // self.feat_size
             j = idx.item() % self.feat_size
-            if i != j:  # skip self-interactions in report
-                w = flat[idx].item()
-                pairs.append((i, j, w))
+            if i != j:
+                pairs.append((i, j, flat[idx].item()))
         return pairs
 
 
 # ---------------------------------------------------------------------------
-# 3. TemporalGenome  (regime-conditioned dynamic lag selection)
+# 3. TemporalGenome
 # ---------------------------------------------------------------------------
 
 class TemporalGenome(nn.Module):
-    LAGS = [1, 2, 3, 5, 8, 13, 20, 34, 55]  # Fibonacci lags
+    LAGS = [1, 2, 3, 5, 8, 13, 20, 34, 55]
 
     def __init__(self, feat_size: int, regime_size: int = 1):
         super().__init__()
-        n_lags          = len(self.LAGS)
-        self.lag_gate   = nn.Sequential(
+        n_lags        = len(self.LAGS)
+        self.lag_gate = nn.Sequential(
             nn.Linear(regime_size, 32),
             nn.Tanh(),
             nn.Linear(32, n_lags),
@@ -172,10 +197,10 @@ class TemporalGenome(nn.Module):
         self.norm     = nn.LayerNorm(feat_size)
 
     def forward(self, z: torch.Tensor, regime: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, T, D  = z.shape
-        lagged   = torch.stack([z.roll(lag, dims=1) for lag in self.LAGS], dim=2)  # (B,T,n,D)
+        B, T, D = z.shape
+        lagged  = torch.stack([z.roll(lag, dims=1) for lag in self.LAGS], dim=2)
         if regime is not None:
-            lag_w = F.softmax(self.lag_gate(regime), dim=-1).unsqueeze(-1)  # (B,T,n,1)
+            lag_w = F.softmax(self.lag_gate(regime), dim=-1).unsqueeze(-1)
         else:
             n     = len(self.LAGS)
             lag_w = torch.ones(B, T, n, 1, device=z.device) / n
@@ -205,6 +230,10 @@ class FeatureGenome(nn.Module):
         z_x  = self.cross(z_op)
         z_t  = self.temporal(z_op, regime)
         return self.fusion(torch.cat([z_x, z_t], dim=-1))
+
+    def alpha_entropy_loss(self) -> torch.Tensor:
+        """Expose SoftOpBank's entropy loss for the training loop."""
+        return self.soft_op.alpha_entropy_loss()
 
     def get_evolved_feature_report(self) -> dict:
         return {

@@ -8,9 +8,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 BATCH, SEQ, RAW_FEAT = 32, 60, 5
-TOTAL_STEPS  = 600         # longer: give CrossFeature time to differentiate
+TOTAL_STEPS  = 600
 SWITCH_STEPS = [200, 400]
 TRANSITION   = 30
+ALPHA_ENT_W  = 0.02   # weight for alpha entropy loss
 
 
 def regime_weight(step):
@@ -44,11 +45,22 @@ model = CASARNNModel(
     use_memory=True,
 ).to(device)
 
-optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+# Separate param groups: alpha gets 10x higher LR
+# This is critical: alpha controls discrete choices and needs
+# stronger gradient signal than continuous weights
+alpha_params = [model.genome.soft_op.alpha]
+other_params = [p for n, p in model.named_parameters()
+                if 'soft_op.alpha' not in n]
+
+optimizer = optim.AdamW([
+    {'params': other_params, 'lr': 3e-4},
+    {'params': alpha_params, 'lr': 3e-3, 'weight_decay': 0.0},  # 10x LR, no wd
+], weight_decay=1e-4)
+
 loss_fn   = CounterfactualLoss(
     alpha=0.1, beta=0.01, gamma=0.05,
     use_nll=True, nll_clamp=3.0,
-    regime_scale=True,   # scale loss down during regime transitions
+    regime_scale=True,
 )
 scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
     optimizer, T_0=100, T_mult=1, eta_min=1e-5
@@ -62,7 +74,13 @@ for step in range(TOTAL_STEPS):
     optimizer.zero_grad()
 
     means, stds, extra = model(x, vol_indicator=vol)
-    loss = loss_fn((means, stds), y, extra)
+    task_loss   = loss_fn((means, stds), y, extra)
+
+    # Auxiliary entropy loss: directly pushes gradient into alpha
+    # Encourages ops to converge to sharp choices (low entropy)
+    alpha_ent   = model.genome.alpha_entropy_loss()
+    loss        = task_loss + ALPHA_ENT_W * alpha_ent
+
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
@@ -78,7 +96,7 @@ for step in range(TOTAL_STEPS):
                     s['exp_avg'].mul_(decay)
     prev_rw = rw
 
-    lv = loss.detach().item()
+    lv = task_loss.detach().item()
     if lv < best_loss:
         best_loss = lv
 
@@ -86,7 +104,6 @@ for step in range(TOTAL_STEPS):
         reg = extra["regime_probs"].mean().item()
         unc = stds.mean().item()
         lr  = optimizer.param_groups[0]["lr"]
-        # op entropy: how converged are the op choices?
         ent = model.genome.soft_op.get_op_entropy()
         tag = " <<< TRANSITION" if abs(rw - round(rw)) > 0.05 else ""
         print(
@@ -100,18 +117,16 @@ for step in range(TOTAL_STEPS):
             f"{tag}"
         )
 
-# Feature report
 print("\n=== Feature Genome Report ===")
 report = model.get_feature_report()
-print(f"Op Entropy (convergence): {report['op_entropy']:.4f}")
-print("  -> Low (<1.5) = ops converged to sharp choices")
-print("  -> High (>2.5) = still exploring")
+print(f"Op Entropy (final): {report['op_entropy']:.4f}")
+print("  -> <1.5: converged  |  >2.5: still exploring")
 
-print("\nTop cross-feature interactions learned:")
+print("\nTop cross-feature interactions:")
 for i, j, w in report["top_interactions"]:
     print(f"  feat[{i:2d}] x feat[{j:2d}]  weight={w:.4f}")
 
-print("\nSample dominant ops (feat0..2, all raw inputs):")
+print("\nDominant ops (feat 0-2):")
 for k, v in list(report["dominant_ops"].items())[:RAW_FEAT * 3]:
     print(f"  {k:20s} -> {v}")
 
