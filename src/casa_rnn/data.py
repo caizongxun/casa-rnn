@@ -1,4 +1,10 @@
-"""Financial feature engineering utilities."""
+"""Financial feature engineering utilities.
+
+v0.9: load_and_enrich() replaces manual feat_cols setup.
+      Enriched features include taker_buy_ratio, close_strength,
+      volume_delta_norm, vol_momentum, momentum_diff.
+      Cross-asset correlation features added when correlated data available.
+"""
 import numpy as np
 import torch
 from typing import Optional
@@ -83,3 +89,7 @@ def make_sequences(
         X_list.append(features[start: start + seq_len])
         y_list.append(targets [start: start + seq_len])
     return torch.stack(X_list), torch.stack(y_list)
+
+
+# Re-export load_and_enrich for convenience
+from casa_rnn.market_data import load_and_enrich  # noqa: E402, F401
