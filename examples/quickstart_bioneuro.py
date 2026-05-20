@@ -1,13 +1,5 @@
 """
-Bio-Neuro Quickstart: deep integration of all bio modules.
-
-NeuromodulatorGating + ThalamicAttention + PrefrontalWorkingMemory are now
-wired INSIDE the RNN timestep loop (multiscale.py), not just demonstrated.
-Every timestep:
-  fused_h -> ThalamicAttention -> NeuromodulatorGating -> PFC-WM -> MemoryBank -> head
-
-HippocampalReplayBuffer remains in the training loop (external).
-OpEntropy warmup ensures alpha converges in first 150 steps.
+Bio-Neuro Quickstart with deep bio integration + meta learning strategies.
 """
 import torch
 import torch.optim as optim
@@ -24,10 +16,10 @@ FEAT   = 16
 TOTAL  = 700
 SWITCH = [200, 450]
 TRANS  = 30
-
 ENTROPY_WARMUP = 150
 ENTROPY_W_MAX  = 0.5
 ENTROPY_W_MIN  = 0.02
+STRATEGY_NAMES = ["rehearsal", "chunking", "associative", "contrastive", "slow"]
 
 
 def regime_weight(step):
@@ -53,9 +45,7 @@ def make_batch(step):
     y     = x[:, :, 3:4].roll(-1, dims=1) * sign
     y    += 0.05 * torch.randn_like(y)
     vol   = x.std(dim=-1, keepdim=True)
-    vol   = (vol - vol.mean()) / (vol.std() + 1e-6)
     return x, y, vol, rw
-
 
 model = CASARNNModel(
     raw_size=RAW_FEAT,
@@ -66,11 +56,10 @@ model = CASARNNModel(
     top_k_pairs=6,
     dropout=0.1,
     use_memory=True,
-    use_bio=True,      # deep bio integration
+    use_bio=True,
 ).to(device)
 
 replay_buf = HippocampalReplayBuffer(capacity=300, replay_every=25)
-
 alpha_params = [model.genome.soft_op.alpha]
 other_params = [p for n, p in model.named_parameters() if 'soft_op.alpha' not in n]
 optimizer = optim.AdamW([
@@ -78,11 +67,8 @@ optimizer = optim.AdamW([
     {'params': alpha_params, 'lr': 3e-3, 'weight_decay': 0.0},
 ], weight_decay=1e-4)
 
-loss_fn   = CounterfactualLoss(alpha=0.1, beta=0.01, gamma=0.05,
-                               use_nll=True, nll_clamp=3.0, regime_scale=True)
-scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    optimizer, T_0=100, T_mult=1, eta_min=1e-5
-)
+loss_fn   = CounterfactualLoss(alpha=0.1, beta=0.01, gamma=0.05, use_nll=True, nll_clamp=3.0, regime_scale=True)
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=1, eta_min=1e-5)
 
 best_loss = float("inf")
 prev_rw   = 0.0
@@ -90,11 +76,8 @@ prev_rw   = 0.0
 for step in range(TOTAL):
     x, y, vol, rw = make_batch(step)
     optimizer.zero_grad()
-
     means, stds, extra = model(x, vol_indicator=vol)
 
-    # RPE for replay and PFC-WM is computed internally now;
-    # here we only need it for the replay buffer push
     with torch.no_grad():
         rpe_scalar = (means - y).abs().mean().item()
 
@@ -102,13 +85,11 @@ for step in range(TOTAL):
     ent_w     = entropy_weight(step)
     loss      = task_loss + ent_w * model.genome.alpha_entropy_loss()
 
-    # Hippocampal replay
     replay_buf.push(x, y, rpe=rpe_scalar)
     if replay_buf.should_replay(step):
         rx, ry = replay_buf.sample_rpe_biased(BATCH // 2)
         rx, ry = rx.to(device), ry.to(device)
         r_vol  = rx.std(dim=-1, keepdim=True)
-        r_vol  = (r_vol - r_vol.mean()) / (r_vol.std() + 1e-6)
         rm, rs, re = model(rx, vol_indicator=r_vol)
         loss   = loss + 0.3 * loss_fn((rm, rs), ry, re)
 
@@ -136,9 +117,12 @@ for step in range(TOTAL):
         unc  = stds.mean().item()
         ent  = model.genome.soft_op.get_op_entropy()
         neuro = extra.get("neuro", {})
-        da   = neuro.get("dopamine", 0)
-        ne   = neuro.get("norepinephrine", 0)
-        tag  = " <<< TRANSITION" if abs(rw - round(rw)) > 0.05 else ""
+        strat = extra.get("strategy_weights", [])
+        dom   = extra.get("dominant_strategy", -1)
+        da    = neuro.get("dopamine", 0)
+        ne    = neuro.get("norepinephrine", 0)
+        sname = STRATEGY_NAMES[dom] if 0 <= dom < len(STRATEGY_NAMES) else "n/a"
+        tag   = " <<< TRANSITION" if abs(rw - round(rw)) > 0.05 else ""
         print(
             f"Step {step:3d} [rw={rw:.2f}]"
             f" | Loss: {lv:+.4f}"
@@ -147,21 +131,20 @@ for step in range(TOTAL):
             f" | Unc: {unc:.4f}"
             f" | OpEnt: {ent:.3f}(w={ent_w:.2f})"
             f" | DA={da:.2f} NE={ne:.2f}"
+            f" | Strat={sname}"
             f"{tag}"
         )
 
 print("\n=== Feature Genome Report ===")
 report = model.get_feature_report()
 print(f"Op Entropy (final): {report['op_entropy']:.4f}")
-
 print("\nTop cross-feature interactions:")
 for i, j, w in report["top_interactions"]:
     print(f"  feat[{i:2d}] x feat[{j:2d}]  weight={w:.4f}")
-
 print("\nDominant ops (feat 0-2):")
 for k, v in list(report["dominant_ops"].items())[:RAW_FEAT * 3]:
     print(f"  {k:20s} -> {v}")
-
 print(f"\nFinal output shape : {means.shape}")
 print(f"Best loss achieved : {best_loss:+.4f}")
 print(f"Final uncertainty  : {stds.mean().item():.4f}")
+print(f"Dominant strategy  : {STRATEGY_NAMES[extra['dominant_strategy']] if extra['dominant_strategy'] >= 0 else 'n/a'}")

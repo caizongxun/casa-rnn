@@ -1,27 +1,12 @@
 """
 Bio-inspired neuromodulation modules for CASA-RNN.
 
-Based on neuroscience research (2024-2025):
-
-1. NeuromodulatorGating
-   Dopamine / Acetylcholine / Norepinephrine / Serotonin gating.
-   Papers: Three-Factor Learning in SNNs (arXiv 2504.05341),
-           Computational Models of Neuromodulation (Frontiers 2026).
-
-2. ThalamicAttention
-   Corticothalamic selective relay (TRN suppression).
-   Papers: Corticothalamic Synaptic Noise as Selective Attention (Frontiers 2015),
-           Neural Circuits That Mediate Selective Attention (PMC 2018).
-
-3. HippocampalReplayBuffer
-   RPE-biased sharp-wave ripple replay.
-   Papers: Post-learning replay biased by RPE (Nature Comms 2025),
-           Brain-Like Replay Naturally Emerges in RL (arXiv 2402.01467).
-
-4. PrefrontalWorkingMemory
-   PFC orthogonal context/content subspaces + BG gating.
-   Papers: Adaptive chunking in PFC-BG circuit (eLife 2025),
-           Compositional architecture in PFC (biorxiv 2025).
+Extended with:
+5. MetaLearningStrategyBank
+   Learns multiple internal "study / memory strategies" and mixes them adaptively.
+   Analogy: humans memorize via repetition, chunking, association, compression,
+   contrastive rehearsal... the model should discover which internal learning mode
+   works best under each regime.
 """
 
 import torch
@@ -37,12 +22,22 @@ import random
 # ---------------------------------------------------------------------------
 
 class NeuromodulatorGating(nn.Module):
-    def __init__(self, hidden_size: int, context_size: int = 2):
+    """
+    Stronger dynamic range than previous version.
+
+    context = [regime, log_vol, vol_of_vol]
+    - DA: surprise / plasticity gate
+    - ACh: sharpening / attention precision
+    - NE: gain control, should rise strongly in volatile periods
+    - 5HT: memory smoothing / decay control
+    """
+    def __init__(self, hidden_size: int, context_size: int = 3):
         super().__init__()
         self.hidden_size = hidden_size
         self.ctx_encoder = nn.Sequential(
             nn.Linear(context_size, 32), nn.Tanh(),
-            nn.Linear(32, 4), nn.Sigmoid(),
+            nn.Linear(32, 16), nn.Tanh(),
+            nn.Linear(16, 4),
         )
         self.da_gate   = nn.Linear(hidden_size, hidden_size)
         self.ach_proj  = nn.Linear(hidden_size, hidden_size)
@@ -51,21 +46,36 @@ class NeuromodulatorGating(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, h: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        neuro = self.ctx_encoder(context)
-        da, ach, ne, sht = [v.unsqueeze(-1) for v in neuro.unbind(dim=-1)]
+        # context shape: (B,T,3)
+        raw = self.ctx_encoder(context)
+        # widen dynamic range
+        da  = torch.sigmoid(raw[..., 0:1] * 2.5)
+        ach = torch.sigmoid(raw[..., 1:2] * 2.0)
+        ne  = torch.sigmoid(raw[..., 2:3] * 3.5)
+        sht = torch.sigmoid(raw[..., 3:4] * 2.0)
 
-        h = da * torch.sigmoid(self.da_gate(h)) + (1 - da) * h
+        # DA: interpolate between old hidden and plastic rewrite
+        plastic = torch.sigmoid(self.da_gate(h))
+        h = (1.0 - da) * h + da * plastic
+
+        # ACh: sharpening contrast
         h_sharp = torch.tanh(self.ach_proj(h))
-        h = h + ach * (h_sharp - h.mean(dim=-1, keepdim=True))
-        h = h * (0.5 + 1.5 * ne)
-        h = sht * h + (1 - sht) * torch.tanh(self.sht_decay(h))
-        h = self.norm(h)
+        h = h + ach * 1.5 * (h_sharp - h.mean(dim=-1, keepdim=True))
 
+        # NE: stronger multiplicative gain, now 0.25x ~ 2.75x
+        gain = 0.25 + 2.5 * ne
+        h = h * gain + 0.1 * ne * torch.tanh(self.ne_gain(h))
+
+        # 5HT: smoothing vs rewriting
+        smooth = torch.tanh(self.sht_decay(h))
+        h = sht * h + (1.0 - sht) * smooth
+
+        h = self.norm(h)
         return h, {
-            "dopamine":       da.squeeze(-1).mean().item(),
-            "acetylcholine":  ach.squeeze(-1).mean().item(),
-            "norepinephrine": ne.squeeze(-1).mean().item(),
-            "serotonin":      sht.squeeze(-1).mean().item(),
+            "dopamine":       da.mean().item(),
+            "acetylcholine":  ach.mean().item(),
+            "norepinephrine": ne.mean().item(),
+            "serotonin":      sht.mean().item(),
         }
 
 
@@ -74,7 +84,7 @@ class NeuromodulatorGating(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ThalamicAttention(nn.Module):
-    def __init__(self, hidden_size: int, context_size: int = 2):
+    def __init__(self, hidden_size: int, context_size: int = 3):
         super().__init__()
         self.trn = nn.Sequential(
             nn.Linear(context_size, hidden_size), nn.Tanh(),
@@ -93,25 +103,12 @@ class ThalamicAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class HippocampalReplayBuffer:
-    """
-    RPE-biased experience replay.
-
-    BUG FIX vs previous version:
-      OLD: push() stored (B,T,D) tensor -> sample stacked them -> (n,B,T,D) = 4D -> crash
-      NEW: push() stores INDIVIDUAL samples (T,D) from the batch
-           sample_rpe_biased() stacks (T,D) tensors -> (n,T,D) = 3D = correct model input
-
-    Each call to push() with a batch of size B adds B individual entries.
-    """
-
     def __init__(self, capacity: int = 500, replay_every: int = 20):
         self.capacity     = capacity
         self.replay_every = replay_every
-        # Each entry: (x: Tensor(T,D), y: Tensor(T,1), rpe: float)
         self.buffer: deque = deque(maxlen=capacity)
 
     def push(self, x: torch.Tensor, y: torch.Tensor, rpe: float) -> None:
-        """x: (B,T,D), y: (B,T,1) - stores each sample individually."""
         x_cpu = x.detach().cpu()
         y_cpu = y.detach().cpu()
         for i in range(x_cpu.shape[0]):
@@ -121,13 +118,12 @@ class HippocampalReplayBuffer:
         return len(self.buffer) >= 16 and step % self.replay_every == 0
 
     def sample_rpe_biased(self, n: int, temperature: float = 2.0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (n,T,D) and (n,T,1) tensors biased toward high-RPE events."""
         buf   = list(self.buffer)
         rpes  = torch.tensor([b[2] for b in buf], dtype=torch.float32)
         probs = F.softmax(rpes * temperature, dim=0).numpy()
         idxs  = random.choices(range(len(buf)), weights=probs, k=n)
-        xs = torch.stack([buf[i][0] for i in idxs])  # (n, T, D)
-        ys = torch.stack([buf[i][1] for i in idxs])  # (n, T, 1)
+        xs = torch.stack([buf[i][0] for i in idxs])
+        ys = torch.stack([buf[i][1] for i in idxs])
         return xs, ys
 
     def __len__(self):
@@ -139,12 +135,6 @@ class HippocampalReplayBuffer:
 # ---------------------------------------------------------------------------
 
 class PrefrontalWorkingMemory(nn.Module):
-    """
-    PFC-BG working memory with orthogonal context/content subspaces.
-    Input gate (D1 striatum): RPE-controlled - only surprising events update WM.
-    Output gate (D2 striatum): task-demand controlled readout.
-    """
-
     def __init__(self, hidden_size: int, context_dim: int = 16):
         super().__init__()
         content_dim      = hidden_size - context_dim
@@ -164,3 +154,65 @@ class PrefrontalWorkingMemory(nn.Module):
         h_combined = torch.cat([h_ctx, h_content], dim=-1)
         h_new      = in_gate * torch.tanh(self.merge(h_combined)) + (1 - in_gate) * h
         return self.norm(self.output_gate(h_new) * h_new)
+
+
+# ---------------------------------------------------------------------------
+# 5. MetaLearningStrategyBank
+# ---------------------------------------------------------------------------
+
+class MetaLearningStrategyBank(nn.Module):
+    """
+    Internal "learning methods" / memory strategies.
+
+    The model chooses a mixture of strategies depending on context and surprise:
+      - rehearsal: repeat / reinforce current representation
+      - chunking: compress nearby dimensions into stable summary
+      - associative: bind to transformed representation
+      - contrastive: emphasize deviations and edges
+      - slow_consolidation: push toward low-frequency stable memory
+
+    This is a meta-learner over internal learning styles, not over optimizer steps.
+    """
+    def __init__(self, hidden_size: int, context_size: int = 3, num_strategies: int = 5):
+        super().__init__()
+        self.num_strategies = num_strategies
+        self.selector = nn.Sequential(
+            nn.Linear(hidden_size + context_size + 1, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, num_strategies),
+        )
+
+        self.rehearsal = nn.Linear(hidden_size, hidden_size)
+        self.chunking = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, hidden_size),
+        )
+        self.associative = nn.Linear(hidden_size, hidden_size)
+        self.contrastive = nn.Linear(hidden_size, hidden_size)
+        self.slow = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, h: torch.Tensor, context: torch.Tensor, rpe: torch.Tensor):
+        # h:(B,T,H), context:(B,T,C), rpe:(B,T,1)
+        sel_in = torch.cat([h, context, rpe], dim=-1)
+        logits = self.selector(sel_in)
+        w = torch.softmax(logits, dim=-1)
+
+        s0 = self.rehearsal(h)
+        s1 = self.chunking(h)
+        s2 = torch.tanh(self.associative(h))
+        s3 = h - torch.tanh(self.contrastive(h))
+        s4 = 0.7 * h + 0.3 * self.slow(h)
+
+        stack = torch.stack([s0, s1, s2, s3, s4], dim=-1)  # (B,T,H,S)
+        mixed = (stack * w.unsqueeze(-2)).sum(dim=-1)
+        out = self.norm(h + mixed)
+
+        return out, {
+            "strategy_weights": w.mean(dim=(0,1)).detach().cpu(),
+            "dominant_strategy": int(w.mean(dim=(0,1)).argmax().item()),
+        }
