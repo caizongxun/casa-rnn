@@ -1,15 +1,13 @@
 """
-encoder.py -- PatchEncoder  (v3)
+encoder.py -- PatchEncoder  (v4)
 
 Fix log
 -------
-* RobustNorm replaced with fast per-channel z-score normalisation.
-  median/quantile on CPU with autograd is very slow and can produce
-  unstable gradients at training start.  z-score is 10x faster and
-  numerically stable.
-* Gate init: uniform random [-1, 1] for diversity (from v2)
-* Positional encoding: sinusoidal warm-start + learnable residual (from v2)
-* enable_nested_tensor=False to suppress UserWarning (from v2)
+* ZScoreNorm now log1p-transforms the volume channel (index 4) before
+  z-scoring.  Raw volume has a vastly different scale from OHLC prices;
+  without log compression the volume channel dominates the norm and
+  washes out price gradient signals.
+* Everything else unchanged from v3.
 """
 
 from __future__ import annotations
@@ -20,25 +18,25 @@ import torch.nn.functional as F
 
 
 class ZScoreNorm(nn.Module):
-    """Per-window, per-channel z-score normalisation.  Fast & autograd-safe."""
+    """
+    Per-window, per-channel z-score normalisation.
+    Volume channel (index 4) is log1p-transformed first.
+    """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C)
-        mean = x.mean(dim=1, keepdim=True)               # (B, 1, C)
-        std  = x.std(dim=1, keepdim=True).clamp(min=1e-6)
+        # x: (B, T, C)  columns = [open, high, low, close, volume]
+        x = x.clone()
+        if x.shape[-1] > 4:
+            x[..., 4] = torch.log1p(x[..., 4].clamp(min=0))
+        mean = x.mean(dim=1, keepdim=True)
+        std  = x.std(dim=1,  keepdim=True).clamp(min=1e-6)
         return (x - mean) / std
 
 
 class SoftFeatureGate(nn.Module):
-    """
-    Learnable gate over d_model dimensions.
-    Initialised with random values so dimensions diverge from epoch 1.
-    """
-
     def __init__(self, d_model: int):
         super().__init__()
-        gate_init = torch.empty(d_model).uniform_(-1.0, 1.0)
-        self.gate = nn.Parameter(gate_init)
+        self.gate = nn.Parameter(torch.empty(d_model).uniform_(-1.0, 1.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(self.gate)
@@ -62,15 +60,15 @@ class PatchEncoder(nn.Module):
         self,
         in_channels: int = 5,
         patch_size: int = 4,
-        d_model: int = 256,
-        n_heads: int = 8,
-        n_layers: int = 4,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 3,
         dropout: float = 0.1,
         max_patches: int = 256,
     ):
         super().__init__()
-        self.patch_size = patch_size
-        self.d_model    = d_model
+        self.patch_size  = patch_size
+        self.d_model     = d_model
         self.max_patches = max_patches
 
         self.norm = ZScoreNorm()
@@ -113,19 +111,17 @@ class PatchEncoder(nn.Module):
             x = F.pad(x, (0, 0, 0, pad))
         n_patches = x.shape[1] // self.patch_size
 
-        x = x.reshape(B, n_patches, self.patch_size * C)
-        x = self.stem(x)
-
+        x   = x.reshape(B, n_patches, self.patch_size * C)
+        x   = self.stem(x)
         cls = self.cls_token.expand(B, -1, -1)
         x   = torch.cat([cls, x], dim=1)
 
         n_seq     = x.shape[1]
         positions = torch.arange(n_seq, device=x.device)
-        pe = self.sin_pe[:n_seq] + self.pos_residual(positions)
-        x  = x + pe
+        x = x + self.sin_pe[:n_seq] + self.pos_residual(positions)
 
         x = self.transformer(x)
-        x = x[:, 0]          # CLS token
+        x = x[:, 0]
         x = self.gate(x)
         x = self.out_norm(x)
         return x
