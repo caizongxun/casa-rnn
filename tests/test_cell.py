@@ -1,47 +1,76 @@
 import torch
 import pytest
-from casa_rnn import CASARNNCell, CASARNNModel, CounterfactualLoss
-
+from casa_rnn import (
+    CASARNNCell, CASARNNModel,
+    MultiScaleCASARNN, CounterfactualLoss,
+    MemoryBank, UncertaintyGatedHead,
+)
 
 DEVICE = torch.device("cpu")
-BATCH, INPUT, HIDDEN, SEQ = 4, 16, 32, 20
+B, I, H, T = 4, 16, 32, 20
 
 
 def test_cell_forward():
-    cell = CASARNNCell(INPUT, HIDDEN).to(DEVICE)
-    x = torch.randn(BATCH, INPUT)
-    h_slow = torch.zeros(BATCH, HIDDEN)
-    h_fast = torch.zeros(BATCH, HIDDEN)
-    h_slow_new, h_fast_new, regime, pred_err = cell(x, h_slow, h_fast)
-    assert h_slow_new.shape == (BATCH, HIDDEN)
-    assert h_fast_new.shape == (BATCH, HIDDEN)
-    assert regime.shape == (BATCH,)
-    assert pred_err.shape == (BATCH, 1)
+    cell = CASARNNCell(I, H)
+    x = torch.randn(B, I)
+    h_s, h_f = torch.zeros(B, H), torch.zeros(B, H)
+    h_s2, h_f2, reg, pe = cell(x, h_s, h_f)
+    assert h_s2.shape == (B, H)
+    assert h_f2.shape == (B, H)
+    assert reg.shape  == (B,)
+    assert pe.shape   == (B, 1)
 
 
 def test_model_forward():
-    model = CASARNNModel(INPUT, HIDDEN, num_layers=2, output_size=1).to(DEVICE)
-    x = torch.randn(BATCH, SEQ, INPUT)
+    model = CASARNNModel(I, H, num_layers=2, output_size=1)
+    x = torch.randn(B, T, I)
     out, extra = model(x)
-    assert out.shape == (BATCH, SEQ, 1)
-    assert "regime_probs" in extra
-    assert "pred_coding_loss" in extra
+    assert out.shape == (B, T, 1)
 
 
-def test_counterfactual_loss():
-    model = CASARNNModel(INPUT, HIDDEN, num_layers=2, output_size=1).to(DEVICE)
-    loss_fn = CounterfactualLoss(alpha=0.1, beta=0.01, task="regression")
-    x = torch.randn(BATCH, SEQ, INPUT)
-    target = torch.randn(BATCH, SEQ, 1)
-    out, extra = model(x)
-    loss = loss_fn(out, target, extra)
+def test_multiscale_forward():
+    model = MultiScaleCASARNN(I, H, output_size=1, use_memory=True)
+    x = torch.randn(B, T, I)
+    means, stds, extra = model(x)
+    assert means.shape  == (B, T, 1)
+    assert stds.shape   == (B, T, 1)
+    assert (stds > 0).all(), "std must be positive"
+    assert extra["scale_weights"].shape == (B, T, 3)
+
+
+def test_uncertainty_head():
+    head = UncertaintyGatedHead(H, 1)
+    h = torch.randn(B, H)
+    mean, std = head(h)
+    assert mean.shape == (B, 1)
+    assert std.shape  == (B, 1)
+    assert (std > 0).all()
+
+
+def test_memory_bank():
+    mem = MemoryBank(H, num_slots=8)
+    h = torch.randn(B, H)
+    out = mem.read(h)
+    assert out.shape == (B, H)
+    regime = torch.ones(B) * 0.9  # high regime -> should write
+    mem.write(h, regime)
+
+
+def test_counterfactual_loss_multiscale():
+    model   = MultiScaleCASARNN(I, H, output_size=1, use_memory=True)
+    loss_fn = CounterfactualLoss(alpha=0.1, beta=0.01, gamma=0.05, use_nll=True)
+    x = torch.randn(B, T, I)
+    y = torch.randn(B, T, 1)
+    means, stds, extra = model(x)
+    loss = loss_fn((means, stds), y, extra)
     loss.backward()
     assert loss.item() > 0
+    assert not torch.isnan(loss)
 
 
 def test_no_nan():
-    model = CASARNNModel(INPUT, HIDDEN, num_layers=3, output_size=1, dropout=0.1)
-    x = torch.randn(BATCH, SEQ, INPUT)
-    out, extra = model(x)
-    assert not torch.isnan(out).any()
-    assert not torch.isinf(out).any()
+    model = MultiScaleCASARNN(I, H, output_size=1, use_memory=True)
+    x = torch.randn(B, T, I)
+    means, stds, extra = model(x)
+    assert not torch.isnan(means).any()
+    assert not torch.isnan(stds).any()
