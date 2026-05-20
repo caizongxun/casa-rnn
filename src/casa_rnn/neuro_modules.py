@@ -1,12 +1,11 @@
 """
 Bio-inspired neuromodulation modules for CASA-RNN.
 
-Extended with:
-5. MetaLearningStrategyBank
-   Learns multiple internal "study / memory strategies" and mixes them adaptively.
-   Analogy: humans memorize via repetition, chunking, association, compression,
-   contrastive rehearsal... the model should discover which internal learning mode
-   works best under each regime.
+1. NeuromodulatorGating  - DA/ACh/NE/5HT with wide dynamic range
+2. ThalamicAttention     - top-down corticothalamic gate
+3. HippocampalReplayBuffer - RPE-biased sharp-wave replay
+4. PrefrontalWorkingMemory - orthogonal context/content + BG gate
+5. MetaLearningStrategyBank - internal learning strategy mixer with entropy regularization
 """
 
 import torch
@@ -23,13 +22,9 @@ import random
 
 class NeuromodulatorGating(nn.Module):
     """
-    Stronger dynamic range than previous version.
-
-    context = [regime, log_vol, vol_of_vol]
-    - DA: surprise / plasticity gate
-    - ACh: sharpening / attention precision
-    - NE: gain control, should rise strongly in volatile periods
-    - 5HT: memory smoothing / decay control
+    context = [regime, log_vol, vol_of_vol] (size=3)
+    NE should correlate with vol_of_vol; DA should correlate with RPE.
+    The BioConstraintLoss in the training loop enforces these semantics.
     """
     def __init__(self, hidden_size: int, context_size: int = 3):
         super().__init__()
@@ -46,36 +41,30 @@ class NeuromodulatorGating(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, h: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        # context shape: (B,T,3)
-        raw = self.ctx_encoder(context)
-        # widen dynamic range
+        raw = self.ctx_encoder(context)          # (B,T,4)
         da  = torch.sigmoid(raw[..., 0:1] * 2.5)
         ach = torch.sigmoid(raw[..., 1:2] * 2.0)
         ne  = torch.sigmoid(raw[..., 2:3] * 3.5)
         sht = torch.sigmoid(raw[..., 3:4] * 2.0)
 
-        # DA: interpolate between old hidden and plastic rewrite
         plastic = torch.sigmoid(self.da_gate(h))
         h = (1.0 - da) * h + da * plastic
 
-        # ACh: sharpening contrast
         h_sharp = torch.tanh(self.ach_proj(h))
         h = h + ach * 1.5 * (h_sharp - h.mean(dim=-1, keepdim=True))
 
-        # NE: stronger multiplicative gain, now 0.25x ~ 2.75x
         gain = 0.25 + 2.5 * ne
         h = h * gain + 0.1 * ne * torch.tanh(self.ne_gain(h))
 
-        # 5HT: smoothing vs rewriting
         smooth = torch.tanh(self.sht_decay(h))
         h = sht * h + (1.0 - sht) * smooth
 
         h = self.norm(h)
         return h, {
-            "dopamine":       da.mean().item(),
-            "acetylcholine":  ach.mean().item(),
-            "norepinephrine": ne.mean().item(),
-            "serotonin":      sht.mean().item(),
+            "dopamine":       da.detach(),
+            "acetylcholine":  ach.detach(),
+            "norepinephrine": ne.detach(),
+            "serotonin":      sht.detach(),
         }
 
 
@@ -160,18 +149,20 @@ class PrefrontalWorkingMemory(nn.Module):
 # 5. MetaLearningStrategyBank
 # ---------------------------------------------------------------------------
 
+STRATEGY_NAMES = ["rehearsal", "chunking", "associative", "contrastive", "slow"]
+
+
 class MetaLearningStrategyBank(nn.Module):
     """
-    Internal "learning methods" / memory strategies.
+    Learns to mix 5 internal memory/learning strategies.
+    Entropy regularization prevents strategy collapse to one mode.
 
-    The model chooses a mixture of strategies depending on context and surprise:
-      - rehearsal: repeat / reinforce current representation
-      - chunking: compress nearby dimensions into stable summary
-      - associative: bind to transformed representation
-      - contrastive: emphasize deviations and edges
-      - slow_consolidation: push toward low-frequency stable memory
-
-    This is a meta-learner over internal learning styles, not over optimizer steps.
+    Strategies:
+      rehearsal    - reinforce/repeat existing representation
+      chunking     - compress via bottleneck then expand
+      associative  - bind to nonlinear transform of h
+      contrastive  - emphasize edges/deviations
+      slow         - blend toward low-frequency stable memory
     """
     def __init__(self, hidden_size: int, context_size: int = 3, num_strategies: int = 5):
         super().__init__()
@@ -181,26 +172,27 @@ class MetaLearningStrategyBank(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_size, num_strategies),
         )
-
-        self.rehearsal = nn.Linear(hidden_size, hidden_size)
-        self.chunking = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.Tanh(),
+        self.rehearsal   = nn.Linear(hidden_size, hidden_size)
+        self.chunking    = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2), nn.Tanh(),
             nn.Linear(hidden_size // 2, hidden_size),
         )
         self.associative = nn.Linear(hidden_size, hidden_size)
         self.contrastive = nn.Linear(hidden_size, hidden_size)
-        self.slow = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
+        self.slow        = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size), nn.Tanh(),
         )
         self.norm = nn.LayerNorm(hidden_size)
 
-    def forward(self, h: torch.Tensor, context: torch.Tensor, rpe: torch.Tensor):
-        # h:(B,T,H), context:(B,T,C), rpe:(B,T,1)
+    def forward(
+        self,
+        h: torch.Tensor,        # (B,T,H)
+        context: torch.Tensor,  # (B,T,C)
+        rpe: torch.Tensor,      # (B,T,1)
+    ) -> Tuple[torch.Tensor, dict]:
         sel_in = torch.cat([h, context, rpe], dim=-1)
         logits = self.selector(sel_in)
-        w = torch.softmax(logits, dim=-1)
+        w = torch.softmax(logits, dim=-1)   # (B,T,S)
 
         s0 = self.rehearsal(h)
         s1 = self.chunking(h)
@@ -209,10 +201,22 @@ class MetaLearningStrategyBank(nn.Module):
         s4 = 0.7 * h + 0.3 * self.slow(h)
 
         stack = torch.stack([s0, s1, s2, s3, s4], dim=-1)  # (B,T,H,S)
-        mixed = (stack * w.unsqueeze(-2)).sum(dim=-1)
-        out = self.norm(h + mixed)
+        mixed = (stack * w.unsqueeze(-2)).sum(dim=-1)        # (B,T,H)
+        out   = self.norm(h + mixed)
 
+        w_mean = w.mean(dim=(0, 1))  # (S,) -- average weights over batch and time
         return out, {
-            "strategy_weights": w.mean(dim=(0,1)).detach().cpu(),
-            "dominant_strategy": int(w.mean(dim=(0,1)).argmax().item()),
+            "strategy_weights":   w_mean.detach().cpu(),
+            "dominant_strategy":  int(w_mean.argmax().item()),
+            "strategy_w_tensor":  w,   # keep grad for entropy loss
         }
+
+    def entropy_loss(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage strategy diversity via negative entropy penalty.
+        Penalizes when all weight collapses to one strategy.
+        w: (B,T,S) from forward()
+        """
+        # mean over batch/time first, then entropy over strategies
+        w_mean = w.mean(dim=(0, 1)).clamp(min=1e-8)   # (S,)
+        return -(w_mean * w_mean.log()).sum()           # maximize entropy

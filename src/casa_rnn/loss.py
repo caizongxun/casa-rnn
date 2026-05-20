@@ -23,18 +23,51 @@ class ContrastiveRegimeLoss(nn.Module):
         return (-sim_pos.mean() + torch.logsumexp(sim_neg, dim=-1).mean()).clamp(min=0.0)
 
 
+class BioConstraintLoss(nn.Module):
+    """
+    Semantic alignment constraints for neuromodulators.
+
+    Two biological priors enforced via soft penalty:
+    1. NE should be positively correlated with vol_of_vol (gain in uncertainty)
+       Penalty = -corr(NE, vol_of_vol), clipped to [0, inf)
+    2. DA should be positively correlated with RPE (surprise drives plasticity)
+       Penalty = -corr(DA, RPE), clipped to [0, inf)
+
+    Enforcing these keeps the neuromodulator semantics from inverting
+    due to optimizer shortcuts.
+    """
+    def __init__(self, ne_weight: float = 0.05, da_weight: float = 0.05):
+        self.ne_w = ne_weight
+        self.da_w = da_weight
+
+    def _soft_corr_penalty(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Penalty = ReLU(-corr(a, b)) -- only penalizes negative correlation."""
+        a = a.flatten()
+        b = b.flatten()
+        if a.numel() < 2:
+            return torch.tensor(0.0, device=a.device)
+        a_c = a - a.mean()
+        b_c = b - b.mean()
+        denom = (a_c.norm() * b_c.norm()).clamp(min=1e-8)
+        corr = (a_c * b_c).sum() / denom
+        return F.relu(-corr)
+
+    def __call__(
+        self,
+        ne: torch.Tensor,          # (B,T,1) or scalar tensor
+        vol_of_vol: torch.Tensor,  # (B,T,1)
+        da: torch.Tensor,          # (B,T,1)
+        rpe: torch.Tensor,         # (B,T,1)
+    ) -> torch.Tensor:
+        ne_penalty = self._soft_corr_penalty(ne, vol_of_vol)
+        da_penalty = self._soft_corr_penalty(da, rpe)
+        return self.ne_w * ne_penalty + self.da_w * da_penalty
+
+
 class CounterfactualLoss(nn.Module):
     """
-    Combined training objective.
-
-    Regime-aware loss scaling (new):
-    When regime uncertainty is high (prob near 0.5 = transition),
-    scale down the NLL loss to prevent the model from over-fitting
-    to a distribution that is currently unstable.
-    This lets the model 'wait and see' during transitions instead of
-    committing to wrong parameters.
+    Combined training objective with regime-aware scaling.
     """
-
     def __init__(
         self,
         alpha: float = 0.1,
@@ -42,7 +75,7 @@ class CounterfactualLoss(nn.Module):
         gamma: float = 0.05,
         use_nll:   bool  = True,
         nll_clamp: float = 3.0,
-        regime_scale: bool = True,   # new: scale loss by regime certainty
+        regime_scale: bool = True,
     ):
         super().__init__()
         self.alpha        = alpha
@@ -61,10 +94,8 @@ class CounterfactualLoss(nn.Module):
         extra:  dict,
         h_slow: torch.Tensor = None,
     ) -> torch.Tensor:
-
         mean, std = pred if isinstance(pred, tuple) else (pred, None)
 
-        # --- Factual loss ---
         if self.use_nll and std is not None:
             dist      = torch.distributions.Normal(mean, std.clamp(min=1e-4))
             nll_elem  = -dist.log_prob(target)
@@ -72,16 +103,12 @@ class CounterfactualLoss(nn.Module):
         else:
             l_factual = self.mse(mean, target)
 
-        # --- Regime-aware scaling ---
-        # Certainty = distance from 0.5: high certainty -> scale=1.0
-        # Near transition (prob~0.5) -> scale down, don't force wrong updates
         regime_probs = extra.get("regime_probs", None)
         if self.regime_scale and regime_probs is not None:
-            certainty  = (regime_probs.mean() - 0.5).abs() * 2  # [0,1]
-            loss_scale = 0.3 + 0.7 * certainty                  # [0.3, 1.0]
+            certainty  = (regime_probs.mean() - 0.5).abs() * 2
+            loss_scale = 0.3 + 0.7 * certainty
             l_factual  = l_factual * loss_scale
 
-        # --- Auxiliary losses ---
         l_pred = extra.get("pred_coding_loss", torch.tensor(0.0, device=mean.device))
 
         if regime_probs is not None:

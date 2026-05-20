@@ -1,11 +1,17 @@
 """
-Bio-Neuro Quickstart with deep bio integration + meta learning strategies.
+Bio-Neuro Quickstart: deep integration + meta learning strategies.
+
+Fixes in this version:
+1. BioConstraintLoss: enforces NE ~ vol_of_vol and DA ~ RPE semantics
+2. StrategyEntropyLoss: prevents strategy bank from collapsing to one mode
+3. vol/rpe tensors passed through to loss for constraint computation
 """
 import torch
 import torch.optim as optim
 import math
 from casa_rnn import CASARNNModel, CounterfactualLoss
-from casa_rnn.neuro_modules import HippocampalReplayBuffer
+from casa_rnn.loss import BioConstraintLoss
+from casa_rnn.neuro_modules import HippocampalReplayBuffer, STRATEGY_NAMES
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -19,7 +25,6 @@ TRANS  = 30
 ENTROPY_WARMUP = 150
 ENTROPY_W_MAX  = 0.5
 ENTROPY_W_MIN  = 0.02
-STRATEGY_NAMES = ["rehearsal", "chunking", "associative", "contrastive", "slow"]
 
 
 def regime_weight(step):
@@ -47,6 +52,7 @@ def make_batch(step):
     vol   = x.std(dim=-1, keepdim=True)
     return x, y, vol, rw
 
+
 model = CASARNNModel(
     raw_size=RAW_FEAT,
     hidden_size=HIDDEN,
@@ -59,10 +65,11 @@ model = CASARNNModel(
     use_bio=True,
 ).to(device)
 
-replay_buf = HippocampalReplayBuffer(capacity=300, replay_every=25)
+replay_buf   = HippocampalReplayBuffer(capacity=300, replay_every=25)
+bio_loss_fn  = BioConstraintLoss(ne_weight=0.05, da_weight=0.05)
 alpha_params = [model.genome.soft_op.alpha]
 other_params = [p for n, p in model.named_parameters() if 'soft_op.alpha' not in n]
-optimizer = optim.AdamW([
+optimizer    = optim.AdamW([
     {'params': other_params, 'lr': 3e-4},
     {'params': alpha_params, 'lr': 3e-3, 'weight_decay': 0.0},
 ], weight_decay=1e-4)
@@ -85,6 +92,25 @@ for step in range(TOTAL):
     ent_w     = entropy_weight(step)
     loss      = task_loss + ent_w * model.genome.alpha_entropy_loss()
 
+    # --- Bio constraint: NE ~ vol_of_vol, DA ~ RPE ---
+    neuro_tensors = extra.get("neuro_tensors", {})
+    vov           = extra.get("vol_of_vol", None)
+    rpe_tensor    = extra.get("rpe_tensor", None)
+    if neuro_tensors and vov is not None and rpe_tensor is not None:
+        loss = loss + bio_loss_fn(
+            ne=neuro_tensors["norepinephrine"],
+            vol_of_vol=vov,
+            da=neuro_tensors["dopamine"],
+            rpe=rpe_tensor,
+        )
+
+    # --- Strategy entropy loss: prevent collapse ---
+    strategy_w = extra.get("strategy_w_raw", None)
+    if strategy_w is not None:
+        strat_ent = model.rnn.strategy_bank.entropy_loss(strategy_w)
+        loss = loss - 0.03 * strat_ent   # maximize entropy = minimize negative entropy
+
+    # Hippocampal replay
     replay_buf.push(x, y, rpe=rpe_scalar)
     if replay_buf.should_replay(step):
         rx, ry = replay_buf.sample_rpe_biased(BATCH // 2)
@@ -117,11 +143,12 @@ for step in range(TOTAL):
         unc  = stds.mean().item()
         ent  = model.genome.soft_op.get_op_entropy()
         neuro = extra.get("neuro", {})
-        strat = extra.get("strategy_weights", [])
-        dom   = extra.get("dominant_strategy", -1)
         da    = neuro.get("dopamine", 0)
         ne    = neuro.get("norepinephrine", 0)
+        dom   = extra.get("dominant_strategy", -1)
         sname = STRATEGY_NAMES[dom] if 0 <= dom < len(STRATEGY_NAMES) else "n/a"
+        sw    = extra.get("strategy_weights", [])
+        sw_str = "|" .join(f"{v:.2f}" for v in sw) if sw else "n/a"
         tag   = " <<< TRANSITION" if abs(rw - round(rw)) > 0.05 else ""
         print(
             f"Step {step:3d} [rw={rw:.2f}]"
@@ -129,9 +156,8 @@ for step in range(TOTAL):
             f" | Best: {best_loss:+.4f}"
             f" | Regime: {reg:.3f}"
             f" | Unc: {unc:.4f}"
-            f" | OpEnt: {ent:.3f}(w={ent_w:.2f})"
             f" | DA={da:.2f} NE={ne:.2f}"
-            f" | Strat={sname}"
+            f" | Strat={sname}[{sw_str}]"
             f"{tag}"
         )
 
@@ -147,4 +173,5 @@ for k, v in list(report["dominant_ops"].items())[:RAW_FEAT * 3]:
 print(f"\nFinal output shape : {means.shape}")
 print(f"Best loss achieved : {best_loss:+.4f}")
 print(f"Final uncertainty  : {stds.mean().item():.4f}")
-print(f"Dominant strategy  : {STRATEGY_NAMES[extra['dominant_strategy']] if extra['dominant_strategy'] >= 0 else 'n/a'}")
+dom_final = extra.get('dominant_strategy', -1)
+print(f"Dominant strategy  : {STRATEGY_NAMES[dom_final] if dom_final >= 0 else 'n/a'}")

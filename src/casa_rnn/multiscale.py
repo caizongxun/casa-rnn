@@ -45,9 +45,9 @@ class MultiScaleCASARNN(nn.Module):
         )
 
         if use_bio:
-            self.thal_attn    = ThalamicAttention(hidden_size, context_size)
-            self.neuro_gate   = NeuromodulatorGating(hidden_size, context_size)
-            self.pfc_wm       = PrefrontalWorkingMemory(hidden_size, context_dim=hidden_size // 4)
+            self.thal_attn     = ThalamicAttention(hidden_size, context_size)
+            self.neuro_gate    = NeuromodulatorGating(hidden_size, context_size)
+            self.pfc_wm        = PrefrontalWorkingMemory(hidden_size, context_dim=hidden_size // 4)
             self.strategy_bank = MetaLearningStrategyBank(hidden_size, context_size, num_strategies=5)
 
         if use_memory:
@@ -66,18 +66,25 @@ class MultiScaleCASARNN(nn.Module):
         decay = min(delta, 1.0) * self.hidden_decay_rate
         return h * (1.0 - decay)
 
-    def forward(self, x: torch.Tensor, vol_indicator: Optional[torch.Tensor] = None, init_hidden: Optional[Dict] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        vol_indicator: Optional[torch.Tensor] = None,
+        init_hidden: Optional[Dict] = None,
+    ):
         batch, seq_len, _ = x.shape
         device = x.device
         hidden = init_hidden if init_hidden is not None else self._init_hidden(batch, device)
 
         means, stds = [], []
         all_regime, all_scale_weights = [], []
-        all_neuro = {"dopamine": [], "acetylcholine": [], "norepinephrine": [], "serotonin": []}
-        strategy_running = []
+        all_neuro_scalar = {"dopamine": [], "acetylcholine": [], "norepinephrine": [], "serotonin": []}
+        # accumulate full tensors for bio constraint loss
+        all_da, all_ne, all_vov, all_rpe_t = [], [], [], []
+        all_strategy_w = []
         total_pred_err = torch.zeros(1, device=device)
 
-        prev_vol = None
+        prev_log_vol = None
         for t in range(seq_len):
             xt = x[:, t, :]
             vt = vol_indicator[:, t, :] if vol_indicator is not None else None
@@ -107,28 +114,34 @@ class MultiScaleCASARNN(nn.Module):
             fused   = self.dropout(fused)
 
             if self.use_bio:
-                regime_t = regime_mean.unsqueeze(-1)                  # (B,1)
+                regime_t = regime_mean.unsqueeze(-1)           # (B,1)
                 vol_t    = vt if vt is not None else torch.zeros_like(regime_t)
-                log_vol  = torch.log1p(vol_t.abs())
-                if prev_vol is None:
-                    vol_of_vol = torch.zeros_like(log_vol)
+                log_vol  = torch.log1p(vol_t.abs())            # (B,1)
+                if prev_log_vol is None:
+                    vov = torch.zeros_like(log_vol)
                 else:
-                    vol_of_vol = (log_vol - prev_vol).abs()
-                prev_vol = log_vol.detach()
+                    vov = (log_vol - prev_log_vol).abs()
+                prev_log_vol = log_vol.detach()
 
-                ctx = torch.cat([regime_t, log_vol, vol_of_vol], dim=-1).unsqueeze(1)  # (B,1,3)
-                h_t = fused.unsqueeze(1)                                                # (B,1,H)
-                rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)                       # (B,1,1)
+                ctx = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)  # (B,1,3)
+                h_t = fused.unsqueeze(1)                                         # (B,1,H)
+                rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)               # (B,1,1)
 
                 h_t = self.thal_attn(h_t, ctx)
-                h_t, neuro_levels = self.neuro_gate(h_t, ctx)
+                h_t, neuro_d = self.neuro_gate(h_t, ctx)
                 h_t = self.pfc_wm(h_t, rpe=rpe_t)
                 h_t, strategy_info = self.strategy_bank(h_t, ctx, rpe_t)
 
                 fused = h_t.squeeze(1)
-                for k, v in neuro_levels.items():
-                    all_neuro[k].append(v)
-                strategy_running.append(strategy_info["strategy_weights"])
+
+                for k in all_neuro_scalar:
+                    all_neuro_scalar[k].append(neuro_d[k].mean().item())
+
+                all_da.append(neuro_d["dopamine"])           # (B,1,1)
+                all_ne.append(neuro_d["norepinephrine"])     # (B,1,1)
+                all_vov.append(vov.unsqueeze(1))             # (B,1,1)
+                all_rpe_t.append(rpe_t)                      # (B,1,1)
+                all_strategy_w.append(strategy_info["strategy_w_tensor"])  # (B,1,S)
 
             if self.use_memory:
                 self.memory.write(fused, regime_mean)
@@ -147,22 +160,36 @@ class MultiScaleCASARNN(nn.Module):
         regime  = torch.cat(all_regime, dim=1)
         scale_w = torch.cat(all_scale_weights, dim=1)
 
-        neuro_summary = {k: (sum(v) / len(v) if v else 0.0) for k, v in all_neuro.items()}
-        if strategy_running:
-            sw = torch.stack(strategy_running).mean(dim=0)
-            dominant_strategy = int(sw.argmax().item())
-            strategy_summary = sw.tolist()
+        neuro_summary = {k: (sum(v) / len(v) if v else 0.0) for k, v in all_neuro_scalar.items()}
+
+        # concat tensors across time for bio constraint and strategy entropy
+        if self.use_bio and all_da:
+            neuro_tensors = {
+                "dopamine":       torch.cat(all_da,  dim=1),  # (B,T,1)
+                "norepinephrine": torch.cat(all_ne,  dim=1),
+            }
+            vov_full  = torch.cat(all_vov,   dim=1)  # (B,T,1)
+            rpe_full  = torch.cat(all_rpe_t, dim=1)  # (B,T,1)
+            strat_raw = torch.cat(all_strategy_w, dim=1)  # (B,T,S)
+            sw_mean   = strat_raw.mean(dim=(0, 1)).detach().cpu().tolist()
+            dom       = int(strat_raw.mean(dim=(0, 1)).argmax().item())
         else:
-            dominant_strategy = -1
-            strategy_summary = []
+            neuro_tensors = {}
+            vov_full = rpe_full = strat_raw = None
+            sw_mean  = []
+            dom      = -1
 
         extra = {
             "pred_coding_loss": total_pred_err / (seq_len * 3),
-            "regime_probs": regime,
-            "scale_weights": scale_w,
-            "final_hidden": hidden,
-            "neuro": neuro_summary,
-            "strategy_weights": strategy_summary,
-            "dominant_strategy": dominant_strategy,
+            "regime_probs":     regime,
+            "scale_weights":    scale_w,
+            "final_hidden":     hidden,
+            "neuro":            neuro_summary,
+            "neuro_tensors":    neuro_tensors,
+            "vol_of_vol":       vov_full,
+            "rpe_tensor":       rpe_full,
+            "strategy_w_raw":   strat_raw,
+            "strategy_weights": sw_mean,
+            "dominant_strategy": dom,
         }
         return means, stds, extra
