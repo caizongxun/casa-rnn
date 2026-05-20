@@ -5,6 +5,7 @@ Fixes in this version:
 1. BioConstraintLoss: enforces NE ~ vol_of_vol and DA ~ RPE semantics
 2. StrategyEntropyLoss: prevents strategy bank from collapsing to one mode
 3. vol/rpe tensors passed through to loss for constraint computation
+4. entropy warmup toned down so task loss remains dominant
 """
 import torch
 import torch.optim as optim
@@ -23,7 +24,7 @@ TOTAL  = 700
 SWITCH = [200, 450]
 TRANS  = 30
 ENTROPY_WARMUP = 150
-ENTROPY_W_MAX  = 0.5
+ENTROPY_W_MAX  = 0.15
 ENTROPY_W_MIN  = 0.02
 
 
@@ -92,7 +93,6 @@ for step in range(TOTAL):
     ent_w     = entropy_weight(step)
     loss      = task_loss + ent_w * model.genome.alpha_entropy_loss()
 
-    # --- Bio constraint: NE ~ vol_of_vol, DA ~ RPE ---
     neuro_tensors = extra.get("neuro_tensors", {})
     vov           = extra.get("vol_of_vol", None)
     rpe_tensor    = extra.get("rpe_tensor", None)
@@ -104,13 +104,11 @@ for step in range(TOTAL):
             rpe=rpe_tensor,
         )
 
-    # --- Strategy entropy loss: prevent collapse ---
     strategy_w = extra.get("strategy_w_raw", None)
     if strategy_w is not None:
         strat_ent = model.rnn.strategy_bank.entropy_loss(strategy_w)
-        loss = loss - 0.03 * strat_ent   # maximize entropy = minimize negative entropy
+        loss = loss - 0.03 * strat_ent
 
-    # Hippocampal replay
     replay_buf.push(x, y, rpe=rpe_scalar)
     if replay_buf.should_replay(step):
         rx, ry = replay_buf.sample_rpe_biased(BATCH // 2)
@@ -141,14 +139,13 @@ for step in range(TOTAL):
     if step % 50 == 0:
         reg  = extra["regime_probs"].mean().item()
         unc  = stds.mean().item()
-        ent  = model.genome.soft_op.get_op_entropy()
         neuro = extra.get("neuro", {})
         da    = neuro.get("dopamine", 0)
         ne    = neuro.get("norepinephrine", 0)
         dom   = extra.get("dominant_strategy", -1)
         sname = STRATEGY_NAMES[dom] if 0 <= dom < len(STRATEGY_NAMES) else "n/a"
         sw    = extra.get("strategy_weights", [])
-        sw_str = "|" .join(f"{v:.2f}" for v in sw) if sw else "n/a"
+        sw_str = "|".join(f"{v:.2f}" for v in sw) if sw else "n/a"
         tag   = " <<< TRANSITION" if abs(rw - round(rw)) > 0.05 else ""
         print(
             f"Step {step:3d} [rw={rw:.2f}]"

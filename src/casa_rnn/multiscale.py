@@ -79,7 +79,6 @@ class MultiScaleCASARNN(nn.Module):
         means, stds = [], []
         all_regime, all_scale_weights = [], []
         all_neuro_scalar = {"dopamine": [], "acetylcholine": [], "norepinephrine": [], "serotonin": []}
-        # accumulate full tensors for bio constraint loss
         all_da, all_ne, all_vov, all_rpe_t = [], [], [], []
         all_strategy_w = []
         total_pred_err = torch.zeros(1, device=device)
@@ -114,18 +113,18 @@ class MultiScaleCASARNN(nn.Module):
             fused   = self.dropout(fused)
 
             if self.use_bio:
-                regime_t = regime_mean.unsqueeze(-1)           # (B,1)
+                regime_t = regime_mean.unsqueeze(-1)
                 vol_t    = vt if vt is not None else torch.zeros_like(regime_t)
-                log_vol  = torch.log1p(vol_t.abs())            # (B,1)
+                log_vol  = torch.log1p(vol_t.abs())
                 if prev_log_vol is None:
                     vov = torch.zeros_like(log_vol)
                 else:
                     vov = (log_vol - prev_log_vol).abs()
                 prev_log_vol = log_vol.detach()
 
-                ctx = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)  # (B,1,3)
-                h_t = fused.unsqueeze(1)                                         # (B,1,H)
-                rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)               # (B,1,1)
+                ctx = torch.cat([regime_t, log_vol, vov], dim=-1).unsqueeze(1)
+                h_t = fused.unsqueeze(1)
+                rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)
 
                 h_t = self.thal_attn(h_t, ctx)
                 h_t, neuro_d = self.neuro_gate(h_t, ctx)
@@ -134,14 +133,16 @@ class MultiScaleCASARNN(nn.Module):
 
                 fused = h_t.squeeze(1)
 
-                for k in all_neuro_scalar:
-                    all_neuro_scalar[k].append(neuro_d[k].mean().item())
+                all_neuro_scalar["dopamine"].append(neuro_d["dopamine"].mean().item())
+                all_neuro_scalar["acetylcholine"].append(neuro_d["acetylcholine"].mean().item())
+                all_neuro_scalar["norepinephrine"].append(neuro_d["norepinephrine"].mean().item())
+                all_neuro_scalar["serotonin"].append(neuro_d["serotonin"].mean().item())
 
-                all_da.append(neuro_d["dopamine"])           # (B,1,1)
-                all_ne.append(neuro_d["norepinephrine"])     # (B,1,1)
-                all_vov.append(vov.unsqueeze(1))             # (B,1,1)
-                all_rpe_t.append(rpe_t)                      # (B,1,1)
-                all_strategy_w.append(strategy_info["strategy_w_tensor"])  # (B,1,S)
+                all_da.append(neuro_d["dopamine_raw"])
+                all_ne.append(neuro_d["norepinephrine_raw"])
+                all_vov.append(vov.unsqueeze(1))
+                all_rpe_t.append(rpe_t)
+                all_strategy_w.append(strategy_info["strategy_w_tensor"])
 
             if self.use_memory:
                 self.memory.write(fused, regime_mean)
@@ -162,15 +163,14 @@ class MultiScaleCASARNN(nn.Module):
 
         neuro_summary = {k: (sum(v) / len(v) if v else 0.0) for k, v in all_neuro_scalar.items()}
 
-        # concat tensors across time for bio constraint and strategy entropy
         if self.use_bio and all_da:
             neuro_tensors = {
-                "dopamine":       torch.cat(all_da,  dim=1),  # (B,T,1)
+                "dopamine":       torch.cat(all_da,  dim=1),
                 "norepinephrine": torch.cat(all_ne,  dim=1),
             }
-            vov_full  = torch.cat(all_vov,   dim=1)  # (B,T,1)
-            rpe_full  = torch.cat(all_rpe_t, dim=1)  # (B,T,1)
-            strat_raw = torch.cat(all_strategy_w, dim=1)  # (B,T,S)
+            vov_full  = torch.cat(all_vov,   dim=1)
+            rpe_full  = torch.cat(all_rpe_t, dim=1)
+            strat_raw = torch.cat(all_strategy_w, dim=1)
             sw_mean   = strat_raw.mean(dim=(0, 1)).detach().cpu().tolist()
             dom       = int(strat_raw.mean(dim=(0, 1)).argmax().item())
         else:

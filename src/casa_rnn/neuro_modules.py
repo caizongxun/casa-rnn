@@ -41,7 +41,7 @@ class NeuromodulatorGating(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, h: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        raw = self.ctx_encoder(context)          # (B,T,4)
+        raw = self.ctx_encoder(context)
         da  = torch.sigmoid(raw[..., 0:1] * 2.5)
         ach = torch.sigmoid(raw[..., 1:2] * 2.0)
         ne  = torch.sigmoid(raw[..., 2:3] * 3.5)
@@ -65,6 +65,10 @@ class NeuromodulatorGating(nn.Module):
             "acetylcholine":  ach.detach(),
             "norepinephrine": ne.detach(),
             "serotonin":      sht.detach(),
+            "dopamine_raw":       da,
+            "acetylcholine_raw":  ach,
+            "norepinephrine_raw": ne,
+            "serotonin_raw":      sht,
         }
 
 
@@ -186,13 +190,13 @@ class MetaLearningStrategyBank(nn.Module):
 
     def forward(
         self,
-        h: torch.Tensor,        # (B,T,H)
-        context: torch.Tensor,  # (B,T,C)
-        rpe: torch.Tensor,      # (B,T,1)
+        h: torch.Tensor,
+        context: torch.Tensor,
+        rpe: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
         sel_in = torch.cat([h, context, rpe], dim=-1)
         logits = self.selector(sel_in)
-        w = torch.softmax(logits, dim=-1)   # (B,T,S)
+        w = torch.softmax(logits, dim=-1)
 
         s0 = self.rehearsal(h)
         s1 = self.chunking(h)
@@ -200,23 +204,17 @@ class MetaLearningStrategyBank(nn.Module):
         s3 = h - torch.tanh(self.contrastive(h))
         s4 = 0.7 * h + 0.3 * self.slow(h)
 
-        stack = torch.stack([s0, s1, s2, s3, s4], dim=-1)  # (B,T,H,S)
-        mixed = (stack * w.unsqueeze(-2)).sum(dim=-1)        # (B,T,H)
+        stack = torch.stack([s0, s1, s2, s3, s4], dim=-1)
+        mixed = (stack * w.unsqueeze(-2)).sum(dim=-1)
         out   = self.norm(h + mixed)
 
-        w_mean = w.mean(dim=(0, 1))  # (S,) -- average weights over batch and time
+        w_mean = w.mean(dim=(0, 1))
         return out, {
             "strategy_weights":   w_mean.detach().cpu(),
             "dominant_strategy":  int(w_mean.argmax().item()),
-            "strategy_w_tensor":  w,   # keep grad for entropy loss
+            "strategy_w_tensor":  w,
         }
 
     def entropy_loss(self, w: torch.Tensor) -> torch.Tensor:
-        """
-        Encourage strategy diversity via negative entropy penalty.
-        Penalizes when all weight collapses to one strategy.
-        w: (B,T,S) from forward()
-        """
-        # mean over batch/time first, then entropy over strategies
-        w_mean = w.mean(dim=(0, 1)).clamp(min=1e-8)   # (S,)
-        return -(w_mean * w_mean.log()).sum()           # maximize entropy
+        w_mean = w.mean(dim=(0, 1)).clamp(min=1e-8)
+        return -(w_mean * w_mean.log()).sum()
