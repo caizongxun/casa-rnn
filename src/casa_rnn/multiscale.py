@@ -2,13 +2,16 @@
 Multi-Scale CASA-RNN -- full bio + topology + pattern pipeline.
 
 Changelog:
-  v0.7 - cell now returns 5 values (added regime_loss).
-         multiscale accumulates regime_self_loss across all steps and scales,
-         adds to extra dict so train loop can include it in total loss.
-         This gives regime_head a genuine gradient signal without external labels.
+  v0.8 - ctx source: (regime,log_vol,vov) -> h_fused stats (mean,std,norm)
+         Neuromodulators now respond to actual hidden-state dynamics.
+       - Learnable hyperparameters optimised by gradient:
+           log_regime_thresh, log_decay_rate, log_tda_w, log_cereb_w,
+           log_regime_loss_w  (all exposed via properties with clamping)
 """
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Dict, List
 from .cell import CASARNNCell
 from .memory import MemoryBank
@@ -46,12 +49,18 @@ class MultiScaleCASARNN(nn.Module):
         num_latent_experts: int = 4,
     ):
         super().__init__()
-        self.hidden_size            = hidden_size
-        self.use_memory             = use_memory
-        self.use_bio                = use_bio
-        self.regime_reset_threshold = regime_reset_threshold
-        self.hidden_decay_rate      = hidden_decay_rate
-        self.input_size             = input_size
+        self.hidden_size = hidden_size
+        self.use_memory  = use_memory
+        self.use_bio     = use_bio
+        self.input_size  = input_size
+
+        # --- Learnable hyperparameters (v0.8) ---
+        # Stored in log-space so they stay positive; properties expose clamped values.
+        self.log_regime_thresh  = nn.Parameter(torch.tensor(math.log(regime_reset_threshold)))
+        self.log_decay_rate     = nn.Parameter(torch.tensor(math.log(hidden_decay_rate)))
+        self.log_tda_w          = nn.Parameter(torch.tensor(math.log(0.1)))   # tda mix weight
+        self.log_cereb_w        = nn.Parameter(torch.tensor(math.log(0.3)))   # cerebellum rpe weight
+        self.log_regime_loss_w  = nn.Parameter(torch.tensor(math.log(1.0)))   # regime self-loss weight
 
         self.pattern_extractor = PatternExtractor(input_size, mid_channels=cnn_mid_channels)
         self.cpg               = CPGEncoder(cpg_periods)
@@ -91,12 +100,42 @@ class MultiScaleCASARNN(nn.Module):
         self.output_size = output_size
         self.register_buffer("regime_ema", torch.tensor(0.5))
 
+    # --- properties expose learnable params with safe ranges ---
+    @property
+    def regime_reset_threshold(self) -> float:
+        return self.log_regime_thresh.exp().clamp(0.01, 0.5).item()
+
+    @property
+    def hidden_decay_rate(self) -> float:
+        return self.log_decay_rate.exp().clamp(0.0, 1.0).item()
+
+    @property
+    def tda_w(self) -> torch.Tensor:
+        return self.log_tda_w.exp().clamp(0.0, 1.0)
+
+    @property
+    def cereb_w(self) -> torch.Tensor:
+        return self.log_cereb_w.exp().clamp(0.0, 1.0)
+
+    @property
+    def regime_loss_w(self) -> torch.Tensor:
+        return self.log_regime_loss_w.exp().clamp(0.1, 5.0)
+
     def _init_hidden(self, batch: int, device: torch.device) -> Dict:
         z = lambda: torch.zeros(batch, self.hidden_size, device=device)
         return {'fast': (z(), z()), 'mid': (z(), z()), 'slow': (z(), z())}
 
     def _soft_decay(self, h: torch.Tensor, delta: float) -> torch.Tensor:
-        return h * (1.0 - min(delta, 1.0) * self.hidden_decay_rate)
+        rate = self.log_decay_rate.exp().clamp(0.0, 1.0)
+        return h * (1.0 - min(delta, 1.0) * rate)
+
+    @staticmethod
+    def _h_ctx(h: torch.Tensor) -> torch.Tensor:
+        """v0.8: build ctx from h statistics so neuro_gate has real variance."""
+        h_mean = h.mean(dim=-1, keepdim=True)                          # (B,1)
+        h_std  = h.std(dim=-1, keepdim=True).clamp(min=1e-6)          # (B,1)
+        h_norm = h.norm(dim=-1, keepdim=True) / (h.shape[-1] ** 0.5)  # (B,1)
+        return torch.cat([h_mean, h_std, h_norm], dim=-1).unsqueeze(1) # (B,1,3)
 
     def forward(
         self,
@@ -137,20 +176,20 @@ class MultiScaleCASARNN(nn.Module):
         all_regime_t            = []
         all_latent_w            = []
         total_pred_err          = torch.zeros(1, device=device)
-        total_regime_loss       = torch.zeros(1, device=device)   # v0.7
+        total_regime_loss       = torch.zeros(1, device=device)
         max_danger              = torch.zeros(1, device=device)
 
         prev_log_vol      = None
         prev_fused        = None
         slow_step_counter = 0
         slow_update_every = 1
+        thresh            = self.regime_reset_threshold  # snapshot once per forward
 
         for t in range(seq_len):
             xt     = x[:, t, :]
             xt_aug = x_aug[:, t, :]
             vt     = vol_indicator[:, t, :] if vol_indicator is not None else None
 
-            # v0.7: unpack 5 return values
             hs_f, hf_f, reg_scalar_f, pe_f, rl_f = self.cell_fast(xt_aug, *hidden['fast'], vt)
             slow_step_counter += 1
             if slow_step_counter >= slow_update_every:
@@ -167,8 +206,8 @@ class MultiScaleCASARNN(nn.Module):
                 pe_s = pe_m.clone()
                 rl_s = rl_m.clone()
 
-            # accumulate self-supervised regime loss
-            total_regime_loss = total_regime_loss + rl_f + rl_m + rl_s
+            # v0.8: scale regime_loss by learnable weight
+            total_regime_loss = total_regime_loss + self.regime_loss_w * (rl_f + rl_m + rl_s)
 
             regime_scalar_mean = (reg_scalar_f + reg_scalar_m + reg_scalar_s) / 3.0
 
@@ -176,7 +215,7 @@ class MultiScaleCASARNN(nn.Module):
             delta = (r_now - self.regime_ema).abs().item()
             self.regime_ema = 0.9 * self.regime_ema + 0.1 * r_now
 
-            if delta > self.regime_reset_threshold:
+            if delta > thresh:
                 hf_f = self._soft_decay(hf_f, delta)
                 hf_m = self._soft_decay(hf_m, delta)
 
@@ -203,14 +242,16 @@ class MultiScaleCASARNN(nn.Module):
                 danger_score = self.danger_det(fused)
                 max_danger   = torch.max(max_danger, danger_score.mean().detach())
 
-                if delta > self.regime_reset_threshold:
+                if delta > thresh:
                     hidden['slow'] = (
                         self.danger_det.selective_reset(hidden['slow'][0], danger_score),
                         self.danger_det.selective_reset(hidden['slow'][1], danger_score),
                     )
 
                 slow_update_every = max(1, int(3.0 / (1.0 + 3.0 * danger_score.mean().item())))
-                fused = fused + 0.1 * tda_h_base
+
+                # v0.8: tda mix uses learnable weight
+                fused = fused + self.tda_w * tda_h_base
 
                 router_weights = self.router(
                     h=fused,
@@ -221,10 +262,8 @@ class MultiScaleCASARNN(nn.Module):
                 all_router_w.append(router_weights)
                 w = router_weights
 
-                regime_ctx  = regime_scalar_mean.unsqueeze(-1)
-                log_vol_ctx = log_vol.mean(dim=-1, keepdim=True)
-                vov_ctx     = vov.mean(dim=-1, keepdim=True)
-                ctx = torch.cat([regime_ctx, log_vol_ctx, vov_ctx], dim=-1).unsqueeze(1)
+                # v0.8: ctx from h_fused statistics instead of regime/vol/vov
+                ctx = self._h_ctx(fused)  # (B,1,3): [h_mean, h_std, h_norm]
 
                 h_t   = fused.unsqueeze(1)
                 rpe_t = ((pe_f + pe_m + pe_s) / 3.0).unsqueeze(1)
@@ -234,7 +273,8 @@ class MultiScaleCASARNN(nn.Module):
                     h_pred_cereb = self.cerebellum(prev_fused, xt_aug)
                     cereb_err    = self.cerebellum.cerebellar_error(h_pred_cereb, fused)
                     w_cereb      = w[:, MODULE_NAMES.index("cerebellum")].unsqueeze(-1).unsqueeze(-1)
-                    rpe_t        = rpe_t + w_cereb * 0.3 * cereb_err.unsqueeze(1)
+                    # v0.8: learnable cereb rpe weight
+                    rpe_t        = rpe_t + w_cereb * self.cereb_w * cereb_err.unsqueeze(1)
                     cereb_err_val = cereb_err.detach().mean().item()
                     all_cereb_err.append(cereb_err_val)
                 prev_fused = fused.detach()
@@ -269,7 +309,7 @@ class MultiScaleCASARNN(nn.Module):
                 all_trans_prob.append(trans_prob)
 
                 w_tda = w[:, MODULE_NAMES.index("tda")].unsqueeze(-1)
-                fused = h_t.squeeze(1) + w_tda * tda_h_base * 0.1
+                fused = h_t.squeeze(1) + w_tda * tda_h_base * self.tda_w
                 h_t   = fused.unsqueeze(1)
 
                 fused_latent, expert_states, latent_w = self.latent_experts(h_t.squeeze(1), expert_states)
@@ -355,9 +395,18 @@ class MultiScaleCASARNN(nn.Module):
             sw_mean = []; dom = -1; avg_cereb = 0.0; danger_full = 0.0
             latent_w_mean = []
 
+        # learnable hyperparam values for logging
+        learnable_params = {
+            "regime_reset_threshold": self.log_regime_thresh.exp().item(),
+            "hidden_decay_rate":      self.log_decay_rate.exp().item(),
+            "tda_mix_weight":         self.log_tda_w.exp().item(),
+            "cereb_rpe_weight":       self.log_cereb_w.exp().item(),
+            "regime_loss_weight":     self.log_regime_loss_w.exp().item(),
+        }
+
         extra = {
             "pred_coding_loss":        total_pred_err / (seq_len * 3),
-            "regime_self_loss":        total_regime_loss / (seq_len * 3),   # v0.7
+            "regime_self_loss":        total_regime_loss / (seq_len * 3),
             "regime_probs":            regime,
             "scale_weights":           scale_w,
             "final_hidden":            hidden,
@@ -382,5 +431,6 @@ class MultiScaleCASARNN(nn.Module):
             "contrastive_loss":        contrastive_loss,
             "latent_expert_weights":   latent_w_mean,
             "curriculum_weight":       max_danger.item(),
+            "learnable_params":        learnable_params,
         }
         return means, stds, extra
