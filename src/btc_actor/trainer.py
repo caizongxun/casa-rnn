@@ -1,13 +1,14 @@
 """
-trainer.py -- ActorTrainer  (v2)
+trainer.py -- ActorTrainer  (v3)
 
 Fix log
 -------
-* Confidence loss is now delayed: only added after epoch >= conf_warmup_epoch
-  (default 5).  In early training the direction loss needs to dominate;
-  adding confidence loss immediately hurts convergence.
-* Gradient norm is now printed every epoch for diagnostics.
-* LR warm-up added: linear ramp over first 3 epochs before cosine decay.
+* _eval_supervised now returns BOTH weighted loss AND unweighted loss + per-class acc
+* train log shows unweighted val loss so it's directly comparable across epochs
+* Label smoothing 0.1 added to weighted CE (reduces overconfident logits)
+* conf_warmup_epoch raised to 8: let CE converge for 8 ep before adding conf loss
+* gradient norm printed every epoch
+* Early-stop patience raised to 10
 """
 
 from __future__ import annotations
@@ -91,34 +92,35 @@ class ActorTrainer:
         y_val:   torch.Tensor,
         epochs:  int = 30,
         batch_size: int = 128,
-        patience: int = 7,
+        patience: int = 10,
         warmup_epochs: int = 3,
-        conf_warmup_epoch: int = 5,
+        conf_warmup_epoch: int = 8,
+        label_smoothing: float = 0.1,
     ):
         print("\n=== Stage 1: Supervised Pre-training ===")
         print(f"  Train: {len(X_train):,}  Val: {len(X_val):,}")
         label_counts = torch.bincount(y_train)
         print(f"  Label dist: LONG={label_counts[0]} FLAT={label_counts[1]} SHORT={label_counts[2]}")
-        print(f"  LR warm-up: {warmup_epochs} epochs | conf loss starts: ep{conf_warmup_epoch}")
+        print(f"  LR warm-up: {warmup_epochs} ep | conf loss starts: ep{conf_warmup_epoch} | smoothing={label_smoothing}")
+        print(f"  {'Ep':>4}  {'train_loss':>10}  {'val_loss(uw)':>12}  {'acc':>6}  "
+              f"{'LONG':>6} {'FLAT':>6} {'SHORT':>6}  {'gnorm':>6}  lr")
 
         weights  = 1.0 / (label_counts.float() + 1)
         weights  = (weights / weights.sum() * 3).to(self.device)
-        ce_loss  = nn.CrossEntropyLoss(weight=weights)
+        ce_w     = nn.CrossEntropyLoss(weight=weights, label_smoothing=label_smoothing)
+        ce_uw    = nn.CrossEntropyLoss()   # unweighted, for display only
 
         train_dl = DataLoader(TensorDataset(X_train, y_train),
                               batch_size=batch_size, shuffle=True, drop_last=True)
         val_dl   = DataLoader(TensorDataset(X_val,   y_val),
                               batch_size=batch_size, shuffle=False)
 
-        # Cosine scheduler (starts after warmup)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.opt, T_max=max(1, epochs - warmup_epochs), eta_min=self.lr * 0.05
         )
 
         no_improve = 0
         for epoch in range(1, epochs + 1):
-
-            # LR warm-up: linear ramp
             if epoch <= warmup_epochs:
                 self._set_lr(self.lr * epoch / warmup_epochs)
 
@@ -128,9 +130,8 @@ class ActorTrainer:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 logits, conf, _ = self.model(xb)
 
-                loss = ce_loss(logits, yb)
+                loss = ce_w(logits, yb)
 
-                # Confidence loss only after warm-up period
                 if epoch >= conf_warmup_epoch:
                     correct = (logits.argmax(dim=1) == yb).float().detach()
                     loss = loss + 0.1 * F.binary_cross_entropy(conf.squeeze(1), correct)
@@ -147,16 +148,15 @@ class ActorTrainer:
             if epoch > warmup_epochs:
                 scheduler.step()
 
-            val_loss, val_acc = self._eval_supervised(val_dl, ce_loss)
+            val_uw_loss, val_acc, per_cls = self._eval_supervised(val_dl, ce_uw)
             avg_loss  = total_loss  / n
             avg_gnorm = total_gnorm / len(train_dl)
             cur_lr    = self.opt.param_groups[0]["lr"]
-            gate_vals = torch.sigmoid(self.model.encoder.gate.gate).detach()
 
-            print(f"[Ep{epoch:02d}] "
-                  f"train={avg_loss:.4f}  val={val_loss:.4f}  acc={val_acc:.3f}  "
-                  f"gnorm={avg_gnorm:.3f}  lr={cur_lr:.2e}  "
-                  f"gate(mean={gate_vals.mean():.3f} std={gate_vals.std():.3f})")
+            print(f"  {epoch:>4d}  {avg_loss:>10.4f}  {val_uw_loss:>12.4f}  "
+                  f"{val_acc:>6.3f}  "
+                  f"{per_cls[0]:>6.3f} {per_cls[1]:>6.3f} {per_cls[2]:>6.3f}  "
+                  f"{avg_gnorm:>6.3f}  {cur_lr:.2e}")
 
             if val_acc > self.best_val_acc:
                 self.best_val_acc = val_acc
@@ -171,16 +171,35 @@ class ActorTrainer:
         print(f"  Best val acc: {self.best_val_acc:.4f}")
 
     @torch.no_grad()
-    def _eval_supervised(self, dl, criterion) -> Tuple[float, float]:
+    def _eval_supervised(
+        self, dl, criterion
+    ) -> Tuple[float, float, list]:
         self.model.eval()
-        total_loss, correct, n = 0.0, 0, 0
+        total_loss = 0.0
+        n = 0
+        all_preds, all_labels = [], []
         for xb, yb in dl:
             xb, yb = xb.to(self.device), yb.to(self.device)
             logits, _, _ = self.model(xb)
             total_loss += criterion(logits, yb).item() * len(xb)
-            correct    += (logits.argmax(dim=1) == yb).sum().item()
-            n          += len(xb)
-        return total_loss / n, correct / n
+            preds = logits.argmax(dim=1)
+            all_preds.append(preds.cpu())
+            all_labels.append(yb.cpu())
+            n += len(xb)
+
+        preds_all  = torch.cat(all_preds)
+        labels_all = torch.cat(all_labels)
+        acc        = (preds_all == labels_all).float().mean().item()
+
+        per_cls = []
+        for c in range(3):
+            mask = labels_all == c
+            if mask.sum() > 0:
+                per_cls.append((preds_all[mask] == c).float().mean().item())
+            else:
+                per_cls.append(0.0)
+
+        return total_loss / n, acc, per_cls
 
     def ppo_finetune(
         self,
@@ -208,7 +227,6 @@ class ActorTrainer:
         valid_idx = list(range(window, len(ohlcv_train) - horizon))
         ohlcv_t   = torch.tensor(ohlcv_train, dtype=torch.float32)
 
-        # PPO uses its own lower LR
         ppo_opt = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-4)
         best_mean_reward = -float("inf")
 
@@ -239,7 +257,7 @@ class ActorTrainer:
                 entropy       = dist_new.entropy().mean()
                 ratio         = torch.exp(log_probs_new - log_probs_old)
                 surr1         = ratio * advantages
-                surr2         = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+                surr2         = torch.clamp(ratio, 1 + clip_eps, 1 - clip_eps) * advantages
                 policy_loss   = -torch.min(surr1, surr2).mean()
                 value_loss    = F.mse_loss(values_new.squeeze(1), returns)
                 loss          = policy_loss + value_coef * value_loss - entropy_coef * entropy
