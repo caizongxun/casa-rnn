@@ -436,7 +436,11 @@ class ActorTrainer:
         backtest_every: int = 50,
         sl_thresh:    float = 0.015,
         sl_penalty:   float = 0.002,
+        batch_size:   int   = 128,   # alias for mini_batch; kept for API compat
     ):
+        # batch_size is an alias for mini_batch to maintain caller compatibility
+        mini_batch = batch_size if batch_size != 128 else mini_batch
+
         print("\n=== Stage 2: PPO Fine-tuning ===")
         print(f"  rollout={rollout_size}  mini_batch={mini_batch}  "
               f"ppo_epochs={ppo_epochs}  n_updates={n_updates}")

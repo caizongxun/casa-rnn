@@ -3,8 +3,8 @@ strategy_miner.py
 
 Two complementary strategy discovery methods:
 
-  PatternMiner  (Type C — recurrent market patterns)
-  ─────────────────────────────────────────────────
+  PatternMiner  (Type C -- recurrent market patterns)
+  -------------------------------------------------
   Extracts the actor's internal hidden-state vectors from the validation
   set, clusters them with KMeans, and for each cluster:
     * computes mean feature values (human-readable profile)
@@ -13,8 +13,8 @@ Two complementary strategy discovery methods:
     * measures win-rate and mean reward
     * names the pattern automatically from its dominant features
 
-  RuleMiner  (Type A — decision rules)
-  ─────────────────────────────────────
+  RuleMiner  (Type A -- decision rules)
+  -------------------------------------
   Trains a shallow decision tree (max_depth=4) to mimic the actor's
   output probabilities on the validation set, then converts every
   leaf path into a plain-English IF/THEN rule with:
@@ -42,10 +42,23 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 # Labels
 _LABEL = {0: "LONG", 1: "FLAT", 2: "SHORT"}
 _LABEL_IDX = {"LONG": 0, "FLAT": 1, "SHORT": 2}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _model_probs(model, xb: torch.Tensor) -> torch.Tensor:
+    """Call model and return softmax probabilities regardless of output type."""
+    out = model(xb)
+    # model returns (logits, conf, hidden) or (logits, conf, hidden, regime)
+    logits = out[0] if isinstance(out, (tuple, list)) else out
+    return F.softmax(logits, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +73,7 @@ class MarketPattern:
     direction:      str               # LONG / FLAT / SHORT
     n_samples:      int
     win_rate:       float             # fraction where signal matched outcome
-    mean_return:    float             # mean forward return (log-return × horizon)
+    mean_return:    float             # mean forward return (log-return x horizon)
     dominant_features: List[str]      # top-3 features driving this cluster
     feature_profile: dict             # feat_name -> mean z-score in cluster
     confidence:     float             # probability mass on the predicted class
@@ -197,8 +210,7 @@ class PatternMiner:
         with torch.no_grad():
             for i in range(0, len(X), 512):
                 xb = X[i:i+512].to(self.device)
-                logits = self.model(xb)
-                probs = torch.softmax(logits, dim=-1)
+                probs = _model_probs(self.model, xb)
                 all_probs.append(probs.cpu().numpy())
         all_probs = np.concatenate(all_probs, axis=0)  # (N, 3)
 
@@ -322,10 +334,9 @@ class RuleMiner:
                 n_samples = int(total)
 
                 # Find which training samples reach this leaf
-                node_indicator = tree.decision_path(X_raw)
-                leaf_ids       = tree.apply(X_raw)
-                in_leaf        = leaf_ids == node
-                n_in_leaf      = int(in_leaf.sum())
+                leaf_ids  = tree.apply(X_raw)
+                in_leaf   = leaf_ids == node
+                n_in_leaf = int(in_leaf.sum())
 
                 if n_in_leaf > 0:
                     y_leaf = y_raw[in_leaf]
@@ -394,8 +405,7 @@ class RuleMiner:
         with torch.no_grad():
             for i in range(0, len(X), 512):
                 xb = X[i:i+512].to(device)
-                logits = model(xb)
-                probs = torch.softmax(logits, dim=-1)
+                probs = _model_probs(model, xb)
                 all_probs.append(probs.cpu().numpy())
         all_probs = np.concatenate(all_probs, axis=0)
         pseudo_labels = all_probs.argmax(axis=1)
@@ -432,7 +442,7 @@ class RuleMiner:
 
         # Filter low-sample leaves and sort by actionability
         rules = [r for r in rules if r.n_samples >= min_samples_leaf]
-        rules = [r for r in rules if r.action != "FLAT"]  # optional: keep only directional
+        rules = [r for r in rules if r.action != "FLAT"]  # keep only directional
         rules.sort(key=lambda r: abs(r.mean_return) * r.win_rate, reverse=True)
 
         print(f"[RuleMiner] Extracted {len(rules)} actionable rules")
