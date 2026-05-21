@@ -1,28 +1,24 @@
 """
-train_actor.py  v5
+train_actor.py  v5.1
 
-Changes vs v4
+Changes vs v5
 -------------
-* Futures features (funding_rate, ls_ratio, open_interest) auto-fetched
-  from Binance via funding.py; zero-filled fallback if network fails.
-* in_channels auto-detected from actual feature matrix (was hardcoded).
-* Walk-forward CV: n_folds=0 -> model itself explores optimal fold count
-  via a lightweight grid search (3 candidate fold sizes, pick best mean acc).
-* Ensemble 3 seeds: always sequential (OOM-safe); explicit gc + cuda empty
-  between seeds.  Memory guard: if a seed OOMs, skip + warn, keep others.
-* HMM regime labels: uses hmmlearn if installed, rule-based fallback.
-  No change needed in regime.py (already handles this).
-* flat_threshold: fully learnable / dynamic via ATR (in trainer.py).
-  train_actor.py just passes atr_col_idx correctly.
+* --no-wfcv is now the default on CPU (fold-search skips automatically when
+  device==cpu AND --wfcv is not explicitly passed, saving ~30 min CPU time).
+* _find_optimal_folds: patience now equals epochs_per_fold so probes always
+  run to completion instead of early-stopping at epoch 4.
+* Default n_folds=9 used when fold-search is skipped.
+* Added --wfcv flag to explicitly enable walk-forward CV on any device.
 
 Usage
 -----
-    python train_actor.py
-    python train_actor.py --seeds 1 --no-wfcv
+    python train_actor.py                         # full pipeline, 3-seed ensemble
+    python train_actor.py --wfcv                  # also run walk-forward CV
+    python train_actor.py --seeds 1               # single model (faster)
     python train_actor.py --pretrain-only
     python train_actor.py --ppo-only
-    python train_actor.py --d-model 256 --n-layers 4 --n-heads 8
-    python train_actor.py --no-futures   # skip funding/ls/oi fetch
+    python train_actor.py --no-futures            # skip funding/ls/oi fetch
+    python train_actor.py --d-model 256 --n-layers 4 --n-heads 8  # GPU
 """
 
 from __future__ import annotations
@@ -71,17 +67,10 @@ def _find_optimal_folds(
     batch_size: int = 128,
 ) -> int:
     """
-    Light grid search over n_folds candidates.
-    Trains a *small* model for epochs_per_fold epochs on each candidate fold
-    count and returns the n_folds with highest mean val_acc.
-
-    This is the "let the model find its own rhythm" part (#18 / #26):
-    the walk-forward fold granularity is treated as a hyper-parameter
-    searched at startup rather than fixed by the user.
-
-    Only the first 3 folds of each candidate are evaluated (speed trade-off).
+    Light grid search over n_folds candidates.  Only first 3 folds of each
+    candidate are probed.  patience is set equal to epochs_per_fold so each
+    probe always runs to completion (no premature early-stop).
     """
-    import copy
     print("\n[fold-search] Searching optimal walk-forward fold count ...")
     best_n, best_acc = candidates[0], -1.0
 
@@ -89,15 +78,15 @@ def _find_optimal_folds(
         N = len(X)
         test_size = max(1, (N - int(N * min_train_frac)) // n_folds)
         accs = []
-        for fold in range(min(n_folds, 3)):   # quick check: only first 3 folds
+        for fold in range(min(n_folds, 3)):
             train_end = int(N * min_train_frac) + fold * test_size
             test_end  = min(train_end + test_size, N)
             if test_end <= train_end:
                 break
             Xt, yt = X[:train_end], y[:train_end]
             Xv, yv = X[train_end:test_end], y[train_end:test_end]
-            rt = r[:train_end]          if r is not None else None
-            rv = r[train_end:test_end]  if r is not None else None
+            rt = r[:train_end]         if r is not None else None
+            rv = r[train_end:test_end] if r is not None else None
 
             probe = BTCActor(**model_cfg)
             tr    = ActorTrainer(
@@ -105,9 +94,14 @@ def _find_optimal_folds(
                 checkpoint_dir=f"/tmp/fold_probe_{n_folds}_{fold}",
             )
             try:
-                tr.pretrain(Xt, yt, Xv, yv, rt, rv,
-                            epochs=epochs_per_fold, batch_size=batch_size,
-                            patience=3, warmup_epochs=1, label_smoothing=0.05)
+                tr.pretrain(
+                    Xt, yt, Xv, yv, rt, rv,
+                    epochs        = epochs_per_fold,
+                    batch_size    = batch_size,
+                    patience      = epochs_per_fold,   # always run to completion
+                    warmup_epochs = 2,
+                    label_smoothing = 0.05,
+                )
                 accs.append(tr.best_val_acc)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -150,13 +144,16 @@ def main():
     ap.add_argument("--pretrain-epochs", type=int,   default=30)
     ap.add_argument("--ppo-updates",     type=int,   default=500)
     ap.add_argument("--batch-size",      type=int,   default=128)
-    ap.add_argument("--no-wfcv",         action="store_true")
+    ap.add_argument("--wfcv",            action="store_true",
+                    help="Enable walk-forward CV + fold-count grid search (slow on CPU)")
     ap.add_argument("--no-futures",      action="store_true",
                     help="Skip fetching funding/ls/oi from Binance")
     ap.add_argument("--pretrain-only",   action="store_true")
     ap.add_argument("--ppo-only",        action="store_true")
     ap.add_argument("--checkpoint-dir",  default="checkpoints")
     ap.add_argument("--val-frac",        type=float, default=0.15)
+    ap.add_argument("--n-folds",         type=int,   default=9,
+                    help="Fixed fold count when --wfcv is off (default 9)")
     args = ap.parse_args()
 
     device = _device()
@@ -164,23 +161,18 @@ def main():
 
     # ------------------------------------------------------------------
     # 1.  Load OHLCV + base features
-    #     load_and_enrich() calls _auto_download() which tries:
-    #       a. Binance Data Vision (S3, no geo-block)
-    #       b. REST API fallback
     # ------------------------------------------------------------------
     df, feat_cols = load_and_enrich(
-        symbol       = args.symbol,
-        interval     = args.interval,
-        data_dir     = Path(args.data_dir),
-        auto_download= True,
-        verbose      = True,
+        symbol        = args.symbol,
+        interval      = args.interval,
+        data_dir      = Path(args.data_dir),
+        auto_download = True,
+        verbose       = True,
     )
     print(f"[train_actor] Loaded {len(df):,} candles  base_feats={len(feat_cols)}")
 
     # ------------------------------------------------------------------
     # 2.  Futures features  (funding rate, long/short ratio, OI)
-    #     load_or_fetch_futures_features() caches to disk and fills zeros
-    #     on any network failure, so this is always safe.
     # ------------------------------------------------------------------
     ts_ms = (df["open_time"].astype(np.int64) // 1_000_000).values
 
@@ -195,7 +187,6 @@ def main():
             df["funding_rate"]  = fut["funding_rate"].astype(np.float32)
             df["ls_ratio"]      = fut["ls_ratio"].astype(np.float32)
             df["open_interest"] = fut["open_interest"].astype(np.float32)
-            # Normalize OI to a returns-like scale (divide by mean)
             oi = df["open_interest"].values.copy()
             oi_mean = oi[oi > 0].mean() if (oi > 0).any() else 1.0
             df["open_interest"] = (oi / (oi_mean + 1e-8)).clip(0, 5).astype(np.float32)
@@ -210,16 +201,14 @@ def main():
         print("[train_actor] --no-futures: skipping futures features")
 
     # ------------------------------------------------------------------
-    # 3.  Build feature matrix  (in_channels auto-detected here)
+    # 3.  Build feature matrix
     # ------------------------------------------------------------------
-    feat_all   = df[feat_cols].values.astype(np.float32)    # (N, C)
+    feat_all   = df[feat_cols].values.astype(np.float32)
     ohlcv_all  = df[["open","high","low","close","volume"]].values.astype(np.float32)
-
-    # atr14 column index used by dynamic flat_threshold in trainer.py
     atr_col_idx = feat_cols.index("atr14") if "atr14" in feat_cols else 9
 
-    N          = len(feat_all)
-    val_start  = int(N * (1 - args.val_frac))
+    N           = len(feat_all)
+    val_start   = int(N * (1 - args.val_frac))
     train_feat  = feat_all[:val_start]
     val_feat    = feat_all[val_start:]
     train_ohlcv = ohlcv_all[:val_start]
@@ -227,17 +216,16 @@ def main():
 
     # ------------------------------------------------------------------
     # 4.  HMM regime labels
-    #     fit_regime_labels() tries hmmlearn first; rule-based fallback.
     # ------------------------------------------------------------------
     print("[train_actor] Fitting regime labels ...")
-    close_all  = ohlcv_all[:, 3]
-    atr_all    = feat_all[:, atr_col_idx]
-    regime_all = fit_regime_labels(close_all, atr_all, n_states=3)
+    close_all    = ohlcv_all[:, 3]
+    atr_all      = feat_all[:, atr_col_idx]
+    regime_all   = fit_regime_labels(close_all, atr_all, n_states=3)
     regime_train = regime_all[:val_start]
     regime_val   = regime_all[val_start:]
 
     # ------------------------------------------------------------------
-    # 5.  Build windows  (dynamic flat_threshold via ATR, #18)
+    # 5.  Build windows
     # ------------------------------------------------------------------
     print("[train_actor] Building windows ...")
     X_train, y_train, r_train = build_windows(
@@ -259,7 +247,7 @@ def main():
     print(f"[train_actor] Windows: train={len(X_train):,}  val={len(X_val):,}  "
           f"in_channels={X_train.shape[-1]}")
 
-    in_channels = X_train.shape[-1]   # auto-detected, not hardcoded
+    in_channels = X_train.shape[-1]
 
     # ------------------------------------------------------------------
     # 6.  Model config
@@ -273,15 +261,13 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # 7.  Walk-forward CV with auto fold-count optimisation  (#26)
-    #     Skipped when --no-wfcv or --ppo-only.
+    # 7.  Walk-forward CV  (opt-in via --wfcv; skipped by default on CPU)
     # ------------------------------------------------------------------
-    if not args.no_wfcv and not args.ppo_only:
+    if args.wfcv and not args.ppo_only:
         X_all_wf = torch.cat([X_train, X_val])
         y_all_wf = torch.cat([y_train, y_val])
         r_all_wf = torch.cat([r_train, r_val]) if r_train is not None else None
 
-        # Let the model find its own optimal fold granularity
         optimal_folds = _find_optimal_folds(
             X_all_wf, y_all_wf, r_all_wf,
             device          = device,
@@ -291,7 +277,6 @@ def main():
             epochs_per_fold = 8,
             batch_size      = args.batch_size,
         )
-
         probe_model   = BTCActor(**model_cfg)
         probe_trainer = ActorTrainer(
             probe_model, device=device,
@@ -307,11 +292,13 @@ def main():
         gc.collect()
         if device != "cpu":
             torch.cuda.empty_cache()
+    else:
+        if not args.ppo_only:
+            print(f"[train_actor] WF-CV skipped (use --wfcv to enable). "
+                  f"Fixed n_folds={args.n_folds} for reference.")
 
     # ------------------------------------------------------------------
-    # 8.  Ensemble training  (3 seeds sequential, OOM-safe)  (#27)
-    #     train_ensemble() wraps each seed in try/except so one OOM
-    #     does not abort the remaining seeds.
+    # 8.  Ensemble training  (3 seeds sequential, OOM-safe)
     # ------------------------------------------------------------------
     if not args.pretrain_only:
         ckpt_paths = train_ensemble(
@@ -335,7 +322,6 @@ def main():
         for p in ckpt_paths:
             print(f"  {p}")
     else:
-        # --pretrain-only: stage 0 + stage 1 only, single model
         model   = BTCActor(**model_cfg)
         trainer = ActorTrainer(model, device=device,
                                checkpoint_dir=args.checkpoint_dir)
@@ -348,7 +334,7 @@ def main():
         gc.collect()
 
     # ------------------------------------------------------------------
-    # 9.  Sanity inference: ensemble signal on last val window
+    # 9.  Sanity inference
     # ------------------------------------------------------------------
     if ckpt_paths:
         sample_window = X_val[:1]
