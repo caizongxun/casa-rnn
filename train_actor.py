@@ -1,13 +1,13 @@
 """
-train_actor.py  (v2)
+train_actor.py  (v3)
 
-Changes
--------
-* Default d_model=128, n_layers=3, n_heads=4  (faster on CPU, same architecture)
-* --d-model 256 --n-layers 4 --n-heads 8 for GPU runs
-* Sanity check: prints first-batch grad norm before training starts
-  to confirm gradients are flowing
-* curl this file fresh after pip install to get latest defaults
+Changes v3
+----------
+* warmup_epochs=1  (was 3) -- shorter warmup stops early epoch L/F/S flipping
+* label_smoothing=0.05 (was 0.1) -- sharper loss surface, faster convergence
+* patience=8 -- give model more time before early stop
+* ppo batch_size = pretrain batch_size * 2 for stable RL estimates
+* --ppo-batch-size override added
 
 Usage
 -----
@@ -46,16 +46,18 @@ def parse_args():
     p.add_argument("--pretrain-epochs", type=int,   default=30)
     p.add_argument("--ppo-updates",     type=int,   default=500)
     p.add_argument("--batch-size",      type=int,   default=128)
+    p.add_argument("--ppo-batch-size",  type=int,   default=0,
+                   help="RL batch size (default: batch-size * 2)")
     p.add_argument("--lr",              type=float, default=3e-4)
     p.add_argument("--val-split",       type=float, default=0.15)
-    p.add_argument("--device",          default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device",
+                   default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--pretrain-only",   action="store_true")
     p.add_argument("--ppo-only",        action="store_true")
     return p.parse_args()
 
 
 def sanity_check(model, X_train, device):
-    """Run one forward+backward pass and print grad norms."""
     print("\n[Sanity] checking gradient flow...")
     model.train()
     xb = X_train[:8].to(device)
@@ -79,13 +81,11 @@ def sanity_check(model, X_train, device):
     else:
         print("  All parameters have gradients -- OK")
 
-    # Check encoder output stats
     with torch.no_grad():
         ctx = model.encoder(xb)
         print(f"  Encoder output  : mean={ctx.mean():.4f}  std={ctx.std():.4f}  "
               f"min={ctx.min():.4f}  max={ctx.max():.4f}")
 
-    # Reset grads
     for p in model.parameters():
         p.grad = None
     print("")
@@ -93,6 +93,8 @@ def sanity_check(model, X_train, device):
 
 def main():
     args = parse_args()
+    ppo_bs = args.ppo_batch_size if args.ppo_batch_size > 0 else args.batch_size * 2
+
     print(f"Device : {args.device}")
     print(f"Model  : d_model={args.d_model}  n_layers={args.n_layers}  n_heads={args.n_heads}")
 
@@ -115,9 +117,9 @@ def main():
     lc = torch.bincount(y)
     print(f"Labels: LONG={lc[0]}  FLAT={lc[1]}  SHORT={lc[2]}")
 
-    n_val      = int(len(X) * args.val_split)
+    n_val            = int(len(X) * args.val_split)
     X_train, y_train = X[:-n_val], y[:-n_val]
-    X_val,   y_val   = X[-n_val:],  y[-n_val:]
+    X_val,   y_val   = X[-n_val:], y[-n_val:]
     ohlcv_train      = ohlcv[:len(ohlcv) - int(len(ohlcv) * args.val_split)]
 
     model = BTCActor(
@@ -130,7 +132,6 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {total_params:,}")
 
-    # ---- Sanity check BEFORE training ----
     sanity_check(model, X_train, args.device)
 
     trainer = ActorTrainer(
@@ -142,6 +143,9 @@ def main():
             X_train, y_train, X_val, y_val,
             epochs=args.pretrain_epochs,
             batch_size=args.batch_size,
+            patience=8,
+            warmup_epochs=1,          # 縮短 warmup，避免前幾個 epoch 亂飄
+            label_smoothing=0.05,     # 降低 smoothing，loss 更乾淨
         )
     else:
         ckpt_path = Path(args.ckpt_dir) / "best_pretrain.pt"
@@ -151,7 +155,11 @@ def main():
         else:
             trainer.pretrain(
                 X_train, y_train, X_val, y_val,
-                epochs=args.pretrain_epochs, batch_size=args.batch_size,
+                epochs=args.pretrain_epochs,
+                batch_size=args.batch_size,
+                patience=8,
+                warmup_epochs=1,
+                label_smoothing=0.05,
             )
 
     if not args.pretrain_only:
@@ -160,7 +168,7 @@ def main():
             window=args.window,
             horizon=args.horizon,
             n_updates=args.ppo_updates,
-            batch_size=args.batch_size,
+            batch_size=ppo_bs,
             flat_threshold=args.flat_thresh,
         )
 
