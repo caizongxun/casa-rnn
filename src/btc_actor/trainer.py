@@ -1,22 +1,11 @@
 """
-trainer.py  v6 -- ActorTrainer (full upgrade)
+trainer.py  v7 -- ActorTrainer
 
-Stages
-------
-  0: Self-supervised masked-patch pre-training
-  1: Supervised classification with:
-     - Focal Loss  (replaces CE + class weight)
-     - Mixup augmentation
-     - Curriculum learning (hard samples phased in)
-     - Regime auxiliary loss (HMM labels)
-     - Dynamic flat_threshold from ATR
-     - Walk-forward cross-validation
-  2: PPO fine-tuning with:
-     - Proper rollout buffer (2048 steps)
-     - Sharpe-aware reward
-     - Stop-loss penalty
-     - Backtest-in-the-loop every 50 updates
-     - Ensemble of 3 seeds trained in sequence (OOM-safe)
+Fixes in v7:
+- backtest-in-the-loop 改成連續時序取樣（不再隨機抽樣），win_rate 才有意義
+- entropy_coef 從 0.03 提高到 0.05，防止過早 collapse
+- 加入 flat_bonus：模型輸出 FLAT 時給予小額正向 reward，保留選擇不交易的能力
+- confidence gate：conf < conf_gate 時 reward 乘以懲罰係數，降低低確信度的亂猜
 """
 
 from __future__ import annotations
@@ -49,31 +38,25 @@ def dynamic_flat_threshold(
     lo: float = 0.001,
     hi: float = 0.01,
 ) -> np.ndarray:
-    """Per-bar threshold = clamp(ATR/close * multiplier, lo, hi)"""
     return np.clip(atr / (close + 1e-8) * multiplier, lo, hi)
 
 
 # ---------------------------------------------------------------------------
-# Window builder  (dynamic threshold)
+# Window builder
 # ---------------------------------------------------------------------------
 def build_windows(
     ohlcv: np.ndarray,
     window: int = 168,
     horizon: int = 4,
-    flat_threshold: float = 0.003,   # ignored when atr14 col present
-    feat_all: Optional[np.ndarray] = None,  # (N, 31) full feature array
-    atr_col_idx: int = 9,                   # index of atr14 in feat_all
+    flat_threshold: float = 0.003,
+    feat_all: Optional[np.ndarray] = None,
+    atr_col_idx: int = 9,
     regime_labels: Optional[np.ndarray] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Returns X (windows of feat_all or ohlcv), y (LONG/FLAT/SHORT),
-    and optionally regime_y.
-    """
     src    = feat_all if feat_all is not None else ohlcv
     close  = ohlcv[:, 3]
     n      = len(src)
 
-    # per-bar threshold
     if feat_all is not None and feat_all.shape[1] > atr_col_idx:
         atr = feat_all[:, atr_col_idx]
         thresholds = dynamic_flat_threshold(atr, close)
@@ -116,20 +99,15 @@ class FocalLoss(nn.Module):
 # ---------------------------------------------------------------------------
 # Mixup
 # ---------------------------------------------------------------------------
-def mixup_batch(
-    xb: torch.Tensor,
-    yb: torch.Tensor,
-    alpha: float = 0.2,
-):
+def mixup_batch(xb, yb, alpha=0.2):
     lam  = np.random.beta(alpha, alpha)
     idx  = torch.randperm(len(xb), device=xb.device)
     x_m  = lam * xb + (1 - lam) * xb[idx]
-    # return mixed x + soft label pairs
     return x_m, yb, yb[idx], lam
 
 
 # ---------------------------------------------------------------------------
-# Reward computation
+# Reward computation  (v7: confidence gate + flat_bonus)
 # ---------------------------------------------------------------------------
 def compute_reward(
     action:     torch.Tensor,
@@ -139,16 +117,31 @@ def compute_reward(
     fee:        float = 0.001,
     sl_thresh:  float = 0.015,
     sl_penalty: float = 0.002,
+    flat_bonus: float = 0.0002,   # 小額獎勵 FLAT，保留不交易能力
+    conf_gate:  float = 0.40,     # 低於此 conf 時 reward 打折
+    conf_penalty: float = 0.5,    # 打折係數
 ) -> torch.Tensor:
     sign     = torch.where(action == 0,  torch.ones_like(log_ret),
                torch.where(action == 2, -torch.ones_like(log_ret),
                            torch.zeros_like(log_ret)))
     fee_mask = (action != 1).float() * fee
-    # Sharpe-aware: scale by rolling volatility
+
+    # Sharpe-aware reward
     sharpe_r = sign * log_ret * confidence / (roll_std + 1e-6) - fee_mask
-    # Stop-loss penalty: directional trade where loss exceeds sl_thresh
-    loss_hit = (sign * log_ret < -sl_thresh).float()
-    return sharpe_r - loss_hit * sl_penalty
+
+    # FLAT bonus
+    flat_mask = (action == 1).float()
+    sharpe_r  = sharpe_r + flat_mask * flat_bonus
+
+    # Stop-loss penalty
+    loss_hit  = (sign * log_ret < -sl_thresh).float()
+    sharpe_r  = sharpe_r - loss_hit * sl_penalty
+
+    # Confidence gate: 低確信度的交易獎勵打折
+    low_conf  = (confidence < conf_gate).float()
+    sharpe_r  = sharpe_r * (1.0 - low_conf * (1.0 - conf_penalty))
+
+    return sharpe_r
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +236,6 @@ class ActorTrainer:
         ce_uw   = nn.CrossEntropyLoss()
         regime_ce = nn.CrossEntropyLoss() if r_train is not None else None
 
-        # curriculum: start with easy (non-flat) samples, add flat later
         easy_mask  = (y_train != 1)
         easy_X, easy_y = X_train[easy_mask], y_train[easy_mask]
         easy_r     = r_train[easy_mask] if r_train is not None else None
@@ -254,7 +246,6 @@ class ActorTrainer:
         no_improve = 0
 
         for epoch in range(1, epochs + 1):
-            # curriculum: phase in flat samples after curriculum_start_epoch
             if epoch < curriculum_start_epoch:
                 Xtr, ytr = easy_X, easy_y
                 rtr      = easy_r
@@ -284,24 +275,20 @@ class ActorTrainer:
                     rb         = None
                 xb, yb = xb.to(self.device), yb.to(self.device)
 
-                # Mixup
                 xb, ya, yb_mix, lam = mixup_batch(xb, yb, mixup_alpha)
                 ya = ya.to(self.device); yb_mix = yb_mix.to(self.device)
 
                 logits, conf, _, regime_logits = self.model(
                     xb, return_regime=True
                 )
-                # mixed focal loss
                 loss = lam * focal(logits, ya) + (1 - lam) * focal(logits, yb_mix)
 
-                # confidence calibration (from ep 5)
                 if epoch >= 5:
                     correct = (logits.argmax(1) == ya).float().detach()
                     loss = loss + 0.1 * F.binary_cross_entropy(
                         conf.squeeze(1), correct
                     )
 
-                # regime auxiliary loss
                 if regime_ce is not None and rb is not None:
                     rb = rb.to(self.device)
                     loss = loss + regime_loss_coef * regime_ce(regime_logits, rb)
@@ -365,16 +352,11 @@ class ActorTrainer:
         X: torch.Tensor,
         y: torch.Tensor,
         r: Optional[torch.Tensor],
-        n_folds: int = 0,           # 0 = auto (target ~1 month test per fold)
+        n_folds: int = 0,
         min_train_frac: float = 0.5,
         epochs: int = 20,
         batch_size: int = 128,
     ) -> List[float]:
-        """
-        Rolling walk-forward CV.
-        If n_folds=0, auto-selects fold size so each test window ~ 720 bars
-        (30 days of 1h data) or 1/12 of total data, whichever is smaller.
-        """
         N = len(X)
         if n_folds == 0:
             test_size = min(720, N // 12)
@@ -395,7 +377,6 @@ class ActorTrainer:
             rt     = r[:train_end]  if r is not None else None
             rv     = r[train_end:test_end] if r is not None else None
 
-            # fresh model copy for each fold
             fold_model = copy.deepcopy(self.model)
             fold_trainer = ActorTrainer(
                 fold_model, self.device, self.lr,
@@ -417,7 +398,7 @@ class ActorTrainer:
         return accs
 
     # -----------------------------------------------------------------------
-    # Stage 2: PPO fine-tuning
+    # Stage 2: PPO fine-tuning  (v7: 連續時序 backtest + entropy 提升)
     # -----------------------------------------------------------------------
     def ppo_finetune(
         self,
@@ -430,26 +411,27 @@ class ActorTrainer:
         mini_batch:   int   = 128,
         ppo_epochs:   int   = 4,
         clip_eps:     float = 0.2,
-        entropy_coef: float = 0.03,
+        entropy_coef: float = 0.05,   # v7: 0.03 -> 0.05，防止 entropy collapse
         value_coef:   float = 0.3,
         flat_threshold: float = 0.003,
         backtest_every: int = 50,
         sl_thresh:    float = 0.015,
         sl_penalty:   float = 0.002,
-        batch_size:   int   = 128,   # alias for mini_batch; kept for API compat
+        flat_bonus:   float = 0.0002, # v7: FLAT 小額獎勵
+        conf_gate:    float = 0.40,   # v7: 低確信度懲罰門檻
+        batch_size:   int   = 128,
     ):
-        # batch_size is an alias for mini_batch to maintain caller compatibility
         mini_batch = batch_size if batch_size != 128 else mini_batch
 
         print("\n=== Stage 2: PPO Fine-tuning ===")
         print(f"  rollout={rollout_size}  mini_batch={mini_batch}  "
               f"ppo_epochs={ppo_epochs}  n_updates={n_updates}")
+        print(f"  entropy_coef={entropy_coef}  flat_bonus={flat_bonus}  conf_gate={conf_gate}")
 
         src    = feat_train if feat_train is not None else ohlcv_train
         close  = ohlcv_train[:, 3]
         N      = len(src)
 
-        # pre-compute per-bar log returns and rolling std
         log_ret_full = np.zeros(N)
         for i in range(N - horizon):
             log_ret_full[i] = math.log(
@@ -473,9 +455,16 @@ class ActorTrainer:
         print(header)
 
         for update in range(1, n_updates + 1):
-            # ---- collect rollout ----
+            # ---- collect rollout (隨機起點，但連續取樣) ----
             self.model.eval()
-            idxs    = np.random.choice(valid_idx, size=rollout_size, replace=True)
+            max_start = max(1, len(valid_idx) - rollout_size)
+            start_idx = np.random.randint(0, max_start)
+            idxs      = valid_idx[start_idx: start_idx + rollout_size]
+            # 補不足的部分（尾端）
+            if len(idxs) < rollout_size:
+                idxs = idxs + valid_idx[:rollout_size - len(idxs)]
+            idxs = idxs[:rollout_size]
+
             obs     = torch.stack([src_t[i - window: i] for i in idxs]).to(self.device)
             lr_b    = torch.tensor([log_ret_full[i]  for i in idxs],
                                    dtype=torch.float32).to(self.device)
@@ -492,11 +481,12 @@ class ActorTrainer:
                 rewards    = compute_reward(
                     actions, lr_b, conf_old.squeeze(1), std_b,
                     sl_thresh=sl_thresh, sl_penalty=sl_penalty,
+                    flat_bonus=flat_bonus, conf_gate=conf_gate,
                 )
                 advantages = rewards - rewards.mean()
                 advantages = advantages / (advantages.std() + 1e-8)
 
-            # ---- PPO updates with mini-batches ----
+            # ---- PPO updates ----
             self.model.train()
             perm = torch.randperm(rollout_size)
             total_pl, total_gnorm, nb = 0.0, 0.0, 0
@@ -539,11 +529,12 @@ class ActorTrainer:
                       f"{entropy.item():>5.3f}  "
                       f"{total_gnorm/nb:>5.3f}")
 
-            # ---- backtest-in-the-loop ----
+            # ---- backtest-in-the-loop（連續時序，才有意義）----
             if update % backtest_every == 0:
                 self.model.eval()
                 with torch.no_grad():
                     act_np = actions.cpu().numpy()
+                # 用連續的 close 序列做 backtest
                 cl_np  = np.array([close[i] for i in idxs])
                 bt     = run_backtest(act_np, cl_np)
                 sharpe = bt["sharpe"]
@@ -557,7 +548,6 @@ class ActorTrainer:
             elif r_mean > (best_sharpe if best_sharpe > -float("inf") else -1):
                 self.model.save(self.ckpt_dir / "best_ppo.pt")
 
-            # free GPU memory each update
             del obs, lr_b, std_b, rewards, advantages, actions, lp_old
             if self.device != "cpu":
                 torch.cuda.empty_cache()
@@ -567,7 +557,7 @@ class ActorTrainer:
 
 
 # ---------------------------------------------------------------------------
-# Ensemble training  (OOM-safe: sequential, not parallel)
+# Ensemble training
 # ---------------------------------------------------------------------------
 def train_ensemble(
     model_cfg:     dict,
@@ -586,10 +576,6 @@ def train_ensemble(
     ppo_updates:   int   = 500,
     batch_size:    int   = 128,
 ) -> List[Path]:
-    """
-    Train n_seeds independent models sequentially (OOM-safe).
-    Returns list of checkpoint paths for ensemble inference.
-    """
     ckpt_paths = []
     for seed in range(n_seeds):
         print(f"\n{'='*60}")
@@ -619,7 +605,6 @@ def train_ensemble(
         best_ckpt = Path(ckpt_s) / "best_ppo.pt"
         ckpt_paths.append(best_ckpt)
 
-        # free model from memory before next seed
         del model, trainer
         gc.collect()
         if device != "cpu":
@@ -638,9 +623,6 @@ def ensemble_signal(
     device: str = "cpu",
     mc_samples: int = 0,
 ) -> dict:
-    """
-    Average logits across ensemble members.
-    """
     if ohlcv_window.dim() == 2:
         ohlcv_window = ohlcv_window.unsqueeze(0)
     all_probs = []
