@@ -1,14 +1,16 @@
 """
-trainer.py -- ActorTrainer  (v4)
+trainer.py -- ActorTrainer  (v5)
 
 Fixes
 -----
-* PPO surr2 clamp bounds were reversed (1+eps, 1-eps) -> fixed to (1-eps, 1+eps)
-* PPO FLAT-collapse detection: if >90% of sampled actions are FLAT for 20
-  consecutive updates, stop early and warn.
-* Pretrain log now shows per-class acc (LONG / FLAT / SHORT) every epoch.
-* train_loss display fixed: show weighted CE only (no conf loss contamination
-  in the displayed number).
+* PPO inner-loop (ppo_epochs > 1) caused ratio collapse on batch_size=64.
+  Replaced with REINFORCE + moving-average baseline (no clipping needed,
+  numerically stable, works on small batches).
+* Reward log now shows mean AND std so you can see if the distribution is
+  collapsing to zero variance.
+* FLAT-collapse detection kept (fires if >90% FLAT for 20 consecutive updates).
+* Action distribution (L/F/S) printed every 10 updates.
+* entropy_coef=0.05 to keep exploration alive on CPU runs.
 """
 
 from __future__ import annotations
@@ -128,19 +130,16 @@ class ActorTrainer:
             for xb, yb in train_dl:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 logits, conf, _ = self.model(xb)
-
                 ce   = ce_w(logits, yb)
                 loss = ce
                 if epoch >= conf_warmup_epoch:
                     correct = (logits.argmax(1) == yb).float().detach()
                     loss = loss + 0.1 * F.binary_cross_entropy(conf.squeeze(1), correct)
-
                 self.opt.zero_grad()
                 loss.backward()
                 gnorm = nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.opt.step()
-
-                total_ce    += ce.item() * len(xb)   # display CE only
+                total_ce    += ce.item() * len(xb)
                 total_gnorm += gnorm.item()
                 n           += len(xb)
 
@@ -148,9 +147,9 @@ class ActorTrainer:
                 scheduler.step()
 
             vl_loss, val_acc, pc = self._eval(val_dl, ce_uw)
-            tr_loss  = total_ce / n
-            avg_gn   = total_gnorm / len(train_dl)
-            cur_lr   = self.opt.param_groups[0]["lr"]
+            tr_loss = total_ce / n
+            avg_gn  = total_gnorm / len(train_dl)
+            cur_lr  = self.opt.param_groups[0]["lr"]
 
             print(f"  {epoch:>4d}  {tr_loss:>8.4f}  {vl_loss:>8.4f}  "
                   f"{val_acc:>5.3f}  "
@@ -184,7 +183,7 @@ class ActorTrainer:
         preds  = torch.cat(all_preds)
         labels = torch.cat(all_labels)
         acc    = (preds == labels).float().mean().item()
-        pc     = []
+        pc = []
         for c in range(3):
             m = labels == c
             pc.append((preds[m] == c).float().mean().item() if m.sum() > 0 else 0.0)
@@ -195,18 +194,25 @@ class ActorTrainer:
         ohlcv_train: np.ndarray,
         window: int = 168,
         horizon: int = 4,
-        n_updates: int = 200,
-        batch_size: int = 64,
-        ppo_epochs: int = 4,
-        clip_eps: float = 0.2,
-        value_coef: float = 0.5,
-        entropy_coef: float = 0.02,
+        n_updates: int = 500,
+        batch_size: int = 256,
+        entropy_coef: float = 0.05,
+        value_coef: float = 0.3,
         flat_threshold: float = 0.003,
         flat_collapse_patience: int = 20,
+        baseline_momentum: float = 0.95,
     ):
-        print("\n=== Stage 2: PPO Fine-tuning ===")
+        """
+        REINFORCE + moving-average baseline (replaces unstable PPO inner loop).
+
+        One gradient step per update. No clipping, no old/new ratio.
+        Stable on small CPU batches.
+        """
+        print("\n=== Stage 2: REINFORCE Fine-tuning ===")
         print(f"  window={window}  horizon={horizon}  n_updates={n_updates}")
-        print(f"  clip_eps={clip_eps}  entropy_coef={entropy_coef}")
+        print(f"  batch={batch_size}  entropy_coef={entropy_coef}  value_coef={value_coef}")
+        print(f"  {'Update':>7}  {'r_mean':>8}  {'r_std':>7}  "
+              f"{'L':>4} {'F':>4} {'S':>4}  {'conf':>6}  {'entr':>6}  {'gnorm':>6}")
 
         close        = ohlcv_train[:, 3]
         log_ret_full = np.zeros(len(ohlcv_train))
@@ -218,73 +224,65 @@ class ActorTrainer:
         valid_idx = list(range(window, len(ohlcv_train) - horizon))
         ohlcv_t   = torch.tensor(ohlcv_train, dtype=torch.float32)
 
-        ppo_opt = torch.optim.AdamW(self.model.parameters(), lr=1e-4, weight_decay=1e-4)
-        best_mean_reward  = -float("inf")
-        flat_streak       = 0
+        rf_opt = torch.optim.AdamW(self.model.parameters(), lr=5e-5, weight_decay=1e-4)
+        best_mean_reward = -float("inf")
+        flat_streak      = 0
+        baseline         = 0.0   # moving average baseline
 
         for update in range(1, n_updates + 1):
-            self.model.eval()
             idxs = np.random.choice(valid_idx, size=batch_size, replace=False)
 
+            self.model.train()
+            Xb   = torch.stack([ohlcv_t[i - window: i] for i in idxs]).to(self.device)
+            lr_b = torch.tensor([log_ret_full[i] for i in idxs],
+                                 dtype=torch.float32).to(self.device)
+
+            logits, conf, values = self.model(Xb)
+            probs   = F.softmax(logits, dim=-1)
+            dist    = torch.distributions.Categorical(probs)
+            actions = dist.sample()
+            entropy = dist.entropy().mean()
+
             with torch.no_grad():
-                Xb   = torch.stack([ohlcv_t[i - window: i] for i in idxs]).to(self.device)
-                lr_b = torch.tensor([log_ret_full[i] for i in idxs],
-                                    dtype=torch.float32).to(self.device)
-                logits_old, conf_old, values_old = self.model(Xb)
-                probs_old     = F.softmax(logits_old, dim=-1)
-                dist_old      = torch.distributions.Categorical(probs_old)
-                actions       = dist_old.sample()
-                log_probs_old = dist_old.log_prob(actions)
-                rewards       = compute_reward(actions, lr_b, conf_old.squeeze(1))
-                advantages    = (rewards - values_old.squeeze(1)).detach()
-                advantages    = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                returns       = rewards.detach()
+                rewards = compute_reward(actions, lr_b, conf.squeeze(1))
+
+            # moving-average baseline
+            batch_mean = rewards.mean().item()
+            baseline   = baseline_momentum * baseline + (1 - baseline_momentum) * batch_mean
+            advantages = (rewards - baseline).detach()
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            log_probs   = dist.log_prob(actions)
+            policy_loss = -(log_probs * advantages).mean()
+            value_loss  = F.mse_loss(values.squeeze(1), rewards.detach())
+            loss        = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+            rf_opt.zero_grad()
+            loss.backward()
+            gnorm = nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            rf_opt.step()
+
+            r_mean  = rewards.mean().item()
+            r_std   = rewards.std().item()
+            ad      = torch.bincount(actions, minlength=3)
 
             # FLAT-collapse detection
-            flat_frac = (actions == 1).float().mean().item()
-            if flat_frac > 0.90:
-                flat_streak += 1
-            else:
-                flat_streak = 0
+            flat_frac = ad[1].item() / batch_size
+            flat_streak = flat_streak + 1 if flat_frac > 0.90 else 0
             if flat_streak >= flat_collapse_patience:
-                print(f"  [PPO] FLAT collapse detected at update {update} "
-                      f"(>{flat_collapse_patience} consecutive updates with "
-                      f">90% FLAT). Stopping PPO early.")
+                print(f"  [RL] FLAT collapse at update {update} -- stopping.")
                 break
 
-            self.model.train()
-            for _ in range(ppo_epochs):
-                logits_new, conf_new, values_new = self.model(Xb)
-                probs_new     = F.softmax(logits_new, dim=-1)
-                dist_new      = torch.distributions.Categorical(probs_new)
-                log_probs_new = dist_new.log_prob(actions)
-                entropy       = dist_new.entropy().mean()
-                ratio         = torch.exp(log_probs_new - log_probs_old)
-                surr1         = ratio * advantages
-                # FIXED: clamp(1-eps, 1+eps)
-                surr2         = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
-                policy_loss   = -torch.min(surr1, surr2).mean()
-                value_loss    = F.mse_loss(values_new.squeeze(1), returns)
-                loss          = policy_loss + value_coef * value_loss - entropy_coef * entropy
-
-                ppo_opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                ppo_opt.step()
-
-            mean_reward = rewards.mean().item()
             if update % 10 == 0 or update == 1:
-                action_dist = torch.bincount(actions, minlength=3)
-                print(f"[PPO u{update:04d}] "
-                      f"reward={mean_reward:+.5f}  "
-                      f"L={action_dist[0]:3d} F={action_dist[1]:3d} S={action_dist[2]:3d}  "
-                      f"conf={conf_old.mean().item():.3f}  "
-                      f"p_loss={policy_loss.item():+.4f}  "
-                      f"entr={entropy.item():.3f}")
+                print(f"  {update:>7d}  {r_mean:>+8.5f}  {r_std:>7.5f}  "
+                      f"{ad[0]:>4d} {ad[1]:>4d} {ad[2]:>4d}  "
+                      f"{conf.mean().item():>6.3f}  "
+                      f"{entropy.item():>6.3f}  "
+                      f"{gnorm:>6.3f}")
 
-            if mean_reward > best_mean_reward:
-                best_mean_reward = mean_reward
+            if r_mean > best_mean_reward:
+                best_mean_reward = r_mean
                 self.model.save(self.ckpt_dir / "best_ppo.pt")
 
         print(f"  Best mean reward: {best_mean_reward:+.6f}")
-        print(f"  Final checkpoint: {self.ckpt_dir}/best_ppo.pt")
+        print(f"  Checkpoint: {self.ckpt_dir}/best_ppo.pt")
